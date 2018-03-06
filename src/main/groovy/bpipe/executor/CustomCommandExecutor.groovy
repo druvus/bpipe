@@ -130,7 +130,7 @@ class CustomCommandExecutor implements CommandExecutor {
      * launching the specified command.
      */
     @Override
-    public void start(Map cfg, Command command, File outputDirectory) {
+    void start(Map cfg, Command command, Appendable outputLog, Appendable errorLog) {
 		
         this.command = command
 		this.config = cfg
@@ -159,6 +159,7 @@ class CustomCommandExecutor implements CommandExecutor {
         String startCmd = pb.command().join(' ')
         log.info "Starting command: " + startCmd
         
+        this.command.createTimeMs = System.currentTimeMillis()
         this.runningCommand = command.command
         this.startedAt = new Date()
 		
@@ -173,9 +174,10 @@ class CustomCommandExecutor implements CommandExecutor {
     	            reportStartError(startCmd, out,err,exitValue)
     	            throw new PipelineError("Failed to start command:\n\n$command.command")
     	        }
-    	        this.commandId = out.toString().trim()
+                String rawOutput = out.toString() + "\n" + err.toString()
+    	        this.commandId = rawOutput.trim()
     	        if(this.commandId.isEmpty())
-    	            throw new PipelineError("Job runner ${this.class.name} failed to return a job id despite reporting success exit code for command:\n\n$startCmd\n\nRaw output was:[" + out.toString() + "]")
+    	            throw new PipelineError("Job runner ${this.class.name} failed to return a job id for job $id ($name) despite reporting success exit code for command:\n\n$startCmd\n\nRaw output was:[" + rawOutput + "]")
     	            
     	        log.info "Started command with id $commandId"
 	        }
@@ -192,8 +194,21 @@ class CustomCommandExecutor implements CommandExecutor {
      */
     void setEnvironment(Map env) {
         
-        env.COMMAND = '('+ command.command + ') > .bpipe/commandtmp/'+command.id+'/'+command.id+'.out 2>  .bpipe/commandtmp/'+command.id+'/'+command.id+'.err'
+        if(config?.stdbuf) {
+            String commandScript = '.bpipe/commandtmp/'+command.id+'/'+command.id+'.sh'
+            File commandScriptFile = new File(commandScript)
+            commandScriptFile.text = command.command
+            commandScriptFile.setExecutable(true)
+            env.COMMAND = 'stdbuf -o0 ' + commandScript + ' > .bpipe/commandtmp/'+command.id+'/'+command.id+'.out 2>  .bpipe/commandtmp/'+command.id+'/'+command.id+'.err'
+        }
+        else {
+            env.COMMAND = '('+ command.command + ') > .bpipe/commandtmp/'+command.id+'/'+command.id+'.out 2>  .bpipe/commandtmp/'+command.id+'/'+command.id+'.err'
+        }
             
+        if(config == null) {
+            return
+        }
+        
         // If an account is specified by the config then use that
         if(config?.account)
             env.ACCOUNT = config.account
@@ -202,7 +217,7 @@ class CustomCommandExecutor implements CommandExecutor {
             env.WALLTIME = config.walltime
        
         if(config?.memory)
-            env.MEMORY = config.memory
+            env.MEMORY = String.valueOf(config.memory)
              
         if(config?.procs)
             env.PROCS = config.procs.toString()
@@ -216,20 +231,49 @@ class CustomCommandExecutor implements CommandExecutor {
         if(config?.custom)
             env.CUSTOM = String.valueOf(config.custom)
             
+        if(config?.post_cmd)
+            env.POST_CMD = String.valueOf(config.post_cmd)
+             
         if(config?.nodes)
             env.NODES = String.valueOf(config.nodes)
+            
+        if(config?.mem_param)
+            env.MEM_PARAM = String.valueOf(config.mem_param)
+            
+        if('custom_submit_options' in config)
+            env.CUSTOM_SUBMIT_OPTS = String.valueOf(config.custom_submit_options)
+  
+        // modules since we may need to load modules before the command... - Simon Gladman (slugger70) 2014
+        if(config?.modules) {
+            log.info "Using modules: $config?.modules"
+            env.MODULES = config.modules
+        }
     }
 	
 	static synchronized acquireLock(Map cfg) {
         OSResourceThrottle.instance.acquireLock(cfg)
 	}
+    
+    transient String lastStatus = CommandStatus.UNKNOWN.name()
+    
+    @Override
+    public String status() {
+        String result = statusImpl()
+        if(command && (result != lastStatus)) {
+            if(result == CommandStatus.RUNNING.name()) {
+                this.command.startTimeMs = System.currentTimeMillis()
+                this.command.save()
+            }
+            lastStatus = result
+        }
+        return result   
+    }
 
     /**
      * For custom commands status is returned by calling the shell script with the
      * 'status' argument and the stored command id.
      */
-    @Override
-    public String status() {
+    public String statusImpl() {
         String cmd = "bash $managementScript status ${commandId}"
 		String result
 		withLock {
@@ -241,18 +285,20 @@ class CustomCommandExecutor implements CommandExecutor {
     	        int exitValue = p.waitFor() 
     	        if(exitValue != 0)
     	            return CommandStatus.UNKNOWN.name()
-    	        result = out.toString()
+    	        result = out.toString().trim()
 	        }
         }
-        if(this.cmd) {
+        
+        String statusValue = result.split()[0]
+        if(this.command) {
             try {
-                this.cmd.setStatus(CommandStatus.forName(result))
+                this.command.setStatus(statusValue)
             }
             catch(Exception e) {
                 log.warning("Failed to update status for result $result: $e")
             }
         }
-        return result.split()[0]
+        return statusValue
     }
 	
 	/**
@@ -314,7 +360,7 @@ class CustomCommandExecutor implements CommandExecutor {
                 String msg = "Attempt to poll status for job $commandId return status $exitValue using command $cmd:\n\n  $out"
                 if(errorCount > MAX_STATUS_ERROR) 
                     throw new PipelineError(msg)
-                log.warning(msg + "(retrying)")
+                log.warning(msg + "(retrying, $errorCount)")
                 errorCount++
                 Thread.sleep(100)
                 continue
@@ -379,9 +425,6 @@ class CustomCommandExecutor implements CommandExecutor {
     void stop() {
         String cmd = "bash $managementScript stop ${commandId}"
         log.info "Executing command to stop command $commandId: $cmd"
-        
-        // Debug:
-        println "\nExecuting command to stop command $commandId: $cmd\n"
         int errorCount = 0
         while(true) {
 			int exitValue
@@ -431,6 +474,6 @@ class CustomCommandExecutor implements CommandExecutor {
     }
     
     String statusMessage() {
-        "$runningCommand, running since $startedAt ($config)"
+        "$runningCommand, running since $startedAt ($config), Job ID = #${commandId}"
     }
 }

@@ -25,8 +25,12 @@
 
 package bpipe
 
+import groovy.transform.CompileStatic
 import groovy.util.logging.Log;
 import groovy.xml.MarkupBuilder
+
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Matcher
 import java.util.regex.Pattern;
 
@@ -56,11 +60,6 @@ class PipelineContext {
     public static File UNCLEAN_FILE_PATH = new File(".bpipe/inprogress")
     
     /**
-     * Directory where metadata for pipeline stage outputs will be written
-     */
-    public final static String OUTPUT_METADATA_DIR = ".bpipe/outputs/"
-    
-    /**
      * This value is returned when a $thread variable is evaluated in a GString
      * (eg. a command from the user).  The reason for this is that Groovy eagerly
      * evaluates GStrings prior to passing them to a function. That means we can't
@@ -71,6 +70,8 @@ class PipelineContext {
      * of threads for the command to use.
      */
     public final static String THREAD_LAZY_VALUE = '__bpipe_lazy_resource_threads__'
+    
+    public final static String MEMORY_LAZY_VALUE = '__bpipe_lazy_resource_memory__'
     
     /**
      * Create a Pipeline Context with the specified adidtional bound variables and
@@ -97,9 +98,10 @@ class PipelineContext {
         this.threadId = Thread.currentThread().getId()
         this.branch = branch
         def pipeline = Pipeline.currentRuntimePipeline.get()
-        if(pipeline)
+        if(pipeline) {
             this.applyName = pipeline.name && !pipeline.nameApplied
-         
+            this.aliases = pipeline.aliases 
+        }
         this.outputLog = new OutputLog(branch.name)
     }
     
@@ -120,12 +122,12 @@ class PipelineContext {
     /**
      * The stage name for which this context is running
      */
-    String stageName
+    String stageName = "Unknown"
     
     /**
      * The directory to which the pipeline stage should write its outputs
      */
-    String outputDirectory = "."
+    String outputDirectory = Config.config.defaultOutputDirectory
     
     /**
      * The id of the thread that created this context
@@ -142,13 +144,12 @@ class PipelineContext {
      */
     boolean customThreadResources = false
    
-    /**
-     * File patterns that will be excluded as inferred output files because they may be created 
-     * frequently as side effects that are not intended to be outputs
-     */
-    Set<String> outputMask = ['\\.bai$', '\\.log$'] as Set
-
     File uncleanFilePath
+    
+    /**
+     * Set of aliases to use for mapping file names
+     */
+    Aliases aliases = null
    
     /**
      * Documentation attributes for the the pipeline stage
@@ -156,6 +157,12 @@ class PipelineContext {
      * tool information is stored as {@link Tool} objects
      */
     Map<String, Object> documentation = [:]
+    
+    /**
+     * A list of Checkers created during execution of the corresponding
+     * pipeline stage.
+     */
+    List<Checker> checkers = []
    
     private List<PipelineStage> pipelineStages
    
@@ -267,6 +274,45 @@ class PipelineContext {
     */
    private OutputLog outputLog
    
+    /**
+     * Set the default inputs and outputs for this context according to the current
+     * state of the given pipeline, and our stage name.
+     * <p>
+     * Note: initialize may not always be called - for silent "joiner" stages a context
+     * is created but not initialized, because these have no inputs or outputs.
+     * 
+     * @param pipeline
+     */
+   void initialize(Pipeline pipeline, String stageName) {
+        this.stageName = stageName
+        if(this.@output == null && this.@defaultOutput == null) {
+            
+            String initialDefaultOutput = stageName
+            if(this.@input) {
+                // If we are running in a sub-pipeline that has a name, make sure we
+                // reflect that in the output file name.  The name should only be applied to files
+                // produced form the first stage in the sub-pipeline
+                if(pipeline.name && !pipeline.nameApplied) {
+                    initialDefaultOutput = Utils.first(this.@input) + "." + pipeline.name + "."+stageName
+                    // Note we don't set pipeline.nameApplied = true here
+                    // if it is really applied then that is flagged in PipelineContext
+                    // Setting the applied flag here will stop it from being applied
+                    // in the transform / filter constructs 
+                }
+                else {
+                    initialDefaultOutput = Utils.first(this.@input) + "." + stageName
+                }
+            }
+            
+            // Ensure there is no directory attached to the default output
+            this.defaultOutput = new File(initialDefaultOutput).name
+        }
+        
+        branch.dirChangeListener = {
+            outputTo(it)
+        }
+    }
+   
    def getDefaultOutput() {
 //       log.info "Returning default output " + this.@defaultOutput
        return this.@defaultOutput
@@ -291,7 +337,12 @@ class PipelineContext {
    }
    
    void setRawOutput(o) {
-       log.info "Setting output $o on context ${this.hashCode()} in thread ${Thread.currentThread().id}"
+
+       if(o == null || o.size()<200)
+           log.info "Setting output $o on context ${this.hashCode()} in thread ${Thread.currentThread().id}"
+       else
+           log.info "Setting ${o.size()} outputs starting with ${o[0..9]} on context ${this.hashCode()} in thread ${Thread.currentThread().id}"
+
        if(Thread.currentThread().id != threadId)
            log.warning "Thread output being set to $o from wrong thread ${Thread.currentThread().id} instead of $threadId"
        
@@ -433,6 +484,9 @@ class PipelineContext {
     *                   $output.bam
     */
    void onNewOutputReferenced(Pipeline pipeline, Object o, String replaced = null) {
+       
+       assert o != null
+       
        if(!allInferredOutputs.contains(o)) 
            allInferredOutputs << o; 
        if(!inferredOutputs.contains(o)) 
@@ -455,6 +509,7 @@ class PipelineContext {
        // Used to 'box' the result, but now this is a PipelineOutput that supports direct access by index, 
        // so should not need it
 //       def result =  Utils.box(raw)
+       raw.multiple = true
        return raw
    }
    
@@ -546,7 +601,10 @@ class PipelineContext {
     * This method is (and must remain) side-effect free
     */
    def toOutputFolder(outputs) {
-       Utils.toDir(outputs, outputDirectory)
+       if(outputDirectory == null)
+           Utils.toDir(outputs, ".")
+       else
+           Utils.toDir(outputs, outputDirectory)
    }
    
    void checkAccompaniedOutputs(List<String> inputsToCheck) {
@@ -610,15 +668,18 @@ class PipelineContext {
     */
    PipelineInput getInputByIndex(int i) {
        
-       def boxed = Utils.box(input)
-       if(boxed.size()<i)
-           throw new PipelineError("Expected $i or more inputs but fewer provided")
-           
-       this.allResolvedInputs << input[i]
        
-       PipelineInput wrapper = new PipelineInput(this.@input, pipelineStages)
+       PipelineInput wrapper = new PipelineInput(this.@input, pipelineStages, this.aliases)
        wrapper.currentFilter = currentFilter
        wrapper.defaultValueIndex = i
+       
+       def boxed = Utils.box(input)
+       if(boxed.size()<i) {
+           wrapper.parentError = new InputMissingError("Stage '$stageName' expected $i or more inputs but fewer provided", this)
+       }
+       else {
+           this.allResolvedInputs << input[i]
+       }
        
        if(!inputWrapper) 
          this.inputWrapper = wrapper
@@ -640,10 +701,10 @@ class PipelineContext {
     */
    def getInput() {
        if(this.@input == null || Utils.isContainer(this.@input) && this.@input.size() == 0) {
-           throw new PipelineError("Input expected but not provided")
+           throw new InputMissingError("Stage '$stageName' expects an input but none are available", this)
        }
        if(!inputWrapper || inputWrapper instanceof MultiPipelineInput) {
-           inputWrapper = new PipelineInput(this.@input, pipelineStages)
+           inputWrapper = new PipelineInput(this.@input, pipelineStages, this.aliases)
            this.allUsedInputWrappers[0] = inputWrapper
        }
        inputWrapper.currentFilter = currentFilter    
@@ -656,7 +717,7 @@ class PipelineContext {
    
    def getInputs() {
        if(!inputWrapper || !(inputWrapper instanceof MultiPipelineInput)) {
-           this.inputWrapper = new MultiPipelineInput(this.@input, pipelineStages)
+           this.inputWrapper = new MultiPipelineInput(this.@input, pipelineStages, this.aliases)
            this.allUsedInputWrappers[0] = inputWrapper
        }
        inputWrapper.currentFilter = currentFilter    
@@ -949,6 +1010,7 @@ class PipelineContext {
           // and then call this one, so we need to ensure that we restore
           // the state  upon exit
           boolean oldProbeMode = this.probeMode
+          boolean probeFailure = false
           this.probeMode = true
           this.trackedOutputs = [:]
           try {
@@ -960,6 +1022,7 @@ class PipelineContext {
             }
             catch(Exception e) {
                 log.info "Exception occurred during proble: $e.message"
+                probeFailure = true
             }
             log.info "Finished probe"
             
@@ -982,17 +1045,23 @@ class PipelineContext {
                 }
             }
             
-            if(!Dependencies.instance.checkUpToDate(outputsToCheck + globExistingFiles,allInputs)) {
-                log.info "Not up to date because input inferred by probe of body newer than outputs"
-            }
-            else
-            if(!Config.config.enableCommandTracking || !checkForModifiedCommands()) {
-                msg("Skipping steps to create ${Utils.box(out).unique()} because " + (lastInputs?"newer than $lastInputs" : " file already exists"))
-                log.info "Skipping produce body"
-                doExecute = false
+            if(probeFailure) {
+                log.info "Not up to date because probe failed"
             }
             else {
-                log.info "Not skipping because of modified command"
+                List<String> outOfDateOutputs = Dependencies.instance.getOutOfDate(outputsToCheck + globExistingFiles,allInputs)
+                if(outOfDateOutputs) {
+                    log.info "Not up to date because input inferred by probe of body newer than outputs"
+                }
+                else
+                if(!Config.config.enableCommandTracking || !checkForModifiedCommands()) {
+                    msg("Skipping steps to create ${Utils.box(out).unique()} because " + (lastInputs?"newer than $lastInputs" : " file already exists"))
+                    log.info "Skipping produce body"
+                    doExecute = false
+                }
+                else {
+                    log.info "Not skipping because of modified command"
+                }
             }
           }
           finally {
@@ -1000,8 +1069,16 @@ class PipelineContext {
           }
         }
         
+        List boxedOutputs = Utils.box(this.@output)
+        
+        // If resuming, the command may actually be running
+        // In that case we want to wait for it and then skip if it executed
+        if(Config.config.mode == "resume") {
+            doExecute = waitForResumableOutputs(boxedOutputs)
+        }
+        
         if(doExecute) {
-            if(Utils.box(this.@output)) {
+            if(boxedOutputs) {
                 this.output = Utils.box(fixedOutputs) +  Utils.box(this.@output).grep { ! (it in fixedOutputs) }
                 this.output.removeAll { it in replacedOutputs  || toOutputFolder(it) in replacedOutputs}
             }
@@ -1172,23 +1249,29 @@ class PipelineContext {
     void uses(Map resourceSpec, Closure block) {
         List<ResourceUnit> res = resourceSpec.collect { e ->
             String name = e.key
-            int n
+            int n = 1
+            int max = 0
             try {
                 if(e.value instanceof String)
                     n = Integer.parseInt(e.value)
-                else
-                    n = e.value
+                else 
+                if(e.value instanceof IntRange) {
+                    n = e.value.from 
+                    max = e.value.to 
+                }
+                else 
+                    n = e.value as Integer
             }
             catch(NumberFormatException f) {
                 throw new PipelineError("The value for resource $e.key ($e.value) couldn't be parsed as a number")
             }
             
             if(name == "GB") {
-                return new ResourceUnit(key: "memory", amount: (n as Integer) * 1024)
+                name = "memory"
+                n = n * 1024
             }
-            else {
-                return new ResourceUnit(key: name, amount: n as Integer)
-            }
+            
+            new ResourceUnit(key: name, amount: n, maxAmount: max)
         }
         resources(res, block)
     }
@@ -1340,8 +1423,11 @@ class PipelineContext {
       
       c.outputs = commandReferencedOutputs
      
-      int exitResult = c.executor.waitFor()
-      if(exitResult != 0) {
+      c.exitCode = c.executor.waitFor()
+      if(c.stopTimeMs <= 0)
+          c.stopTimeMs = System.currentTimeMillis()
+          
+      if(c.exitCode != 0) {
         // Output is still spooling from the process.  By waiting a bit we ensure
         // that we don't interleave the exception trace with the output
         Thread.sleep(200)
@@ -1349,7 +1435,9 @@ class PipelineContext {
         if(!this.probeMode)
             this.commandManager.cleanup(c)
             
-        throw new CommandFailedException("Command failed with exit status = $exitResult : \n\n$c.command")
+        log.info "Command $c.id in branch $branch failed with exit code $c.exitCode"
+        
+        throw new CommandFailedException("Command in stage $stageName failed with exit status = $c.exitCode : \n\n$c.command", this)
       }
       
       if(!this.probeMode)
@@ -1373,7 +1461,7 @@ class PipelineContext {
         }
         
         if(!inputWrapper)
-           inputWrapper = new PipelineInput(this.@input, pipelineStages)
+           inputWrapper = new PipelineInput(this.@input, pipelineStages, this.aliases)
            
            
        // On OSX and Linux, R actively attaches to and listens to signals on the
@@ -1385,14 +1473,7 @@ class PipelineContext {
        // but see here: 
        // http://stackoverflow.com/questions/20338162/how-can-i-launch-a-new-process-that-is-not-a-child-of-the-original-process
        String setSid = Utils.isLinux() ? " setsid " : ""
-       
-       String rscriptExe = "Rscript"
-       if(Config.userConfig.containsKey("R") && Config.userConfig.R.containsKey("executable")) {
-           rscriptExe = Config.userConfig.R.executable
-           log.info "Using custom R executable: $rscriptExe"
-       }
-           
-       
+       String rscriptExe = Utils.resolveRscriptExe()
        boolean oldEchoFlag = this.echoWhenNotFound
        try {
             this.echoWhenNotFound = true
@@ -1409,6 +1490,95 @@ class PipelineContext {
        }
     }
     
+    void python(String pythonCommand) {
+        String python = resolveExe("python","python")
+        exec("""
+        $python <<!
+        $pythonCommand
+        !
+        """.stripIndent(), false)    
+    }
+    
+    /**
+     * Execute the given sqlite command against the given database
+     * <p>
+     * The main reason this was implemented is because sqlite 
+     * attaches to the parent process group signal so it terminates on
+     * control-c unless we use setSid - see below. So it gets annoying to run
+     * it in Bpipe without this helper.
+     * 
+     * @param db
+     * @param sqlCommand
+     */
+    void sqlite(def db, String sqlCommand, String config = null) {
+        
+        String setSid = Utils.isLinux() ? " setsid " : ""
+        String sqliteCommand = resolveExe("sqlite","sqlite3")
+        exec("""
+        $setSid $sqliteCommand $db <<!
+        $sqlCommand
+        !
+        """.stripIndent(), false, config)    
+    }
+    
+    void groovy(String groovyCommand, String config) {
+        groovy([config:config], groovyCommand)
+    }
+    
+    void groovy(String groovyCommand) {
+        groovy([:], groovyCommand)
+    }
+    
+    void groovy(Map opts, String groovyCommand) {
+        
+        String cp = ""
+        if(Config.userConfig.containsKey("libs")) {
+            def libs = Config.userConfig.libs
+            if(libs instanceof List)
+                libs = libs.join(':')
+            cp = "-cp ${libs}"
+        }
+        
+        String javaOpts = "-noverify " + (opts.javaOpts?:"")
+        
+        String javaExe = Utils.resolveExe("java", null)
+        String SET_JH = ""
+        if(javaExe != null) {
+           String javaHome = new File(javaExe).absoluteFile.parentFile.parentFile 
+           SET_JH="""unset JAVA_HOME; export PATH="$javaHome/bin:\$PATH";"""
+        } 
+        
+        String groovyExe = Utils.resolveExe("groovy","groovy")
+        String groovyHome = new File(groovyExe).absoluteFile.parentFile.parentFile 
+        
+        String cmd = """
+        $SET_JH
+        unset GROOVY_HOME
+
+        GROOVY_CMD=\$(cat <<XXXX
+        $groovyCommand
+        XXXX
+        )
+
+        JAVA_OPTS='$javaOpts' $groovyExe $cp -e "\$GROOVY_CMD"
+        """.stripIndent()
+        
+        if(opts.config) {
+            exec(cmd, false, opts.config)    
+        }
+        else {
+            exec(cmd, false)    
+        }
+    } 
+    
+    /**
+     * Undocumented feature: run a command and capture its output into a pipeline variable
+     * This currently just runs the command directly.
+     * 
+     * @TODO run it properly through the CommandManager
+     * @param cmd
+     * @return
+     */
     String capture(String cmd) {
       if(probeMode)
           return ""
@@ -1416,11 +1586,15 @@ class PipelineContext {
       CommandLog.cmdLog.write(cmd)
       def joined = ""
       cmd.eachLine { joined += " " + it }
-      
       Process p = Runtime.getRuntime().exec((String[])(['bash','-c',"$joined"].toArray()))
       StringWriter outputBuffer = new StringWriter()
-      p.consumeProcessOutput(outputBuffer,System.err)
-      p.waitFor()
+      Thread t1 = p.consumeProcessOutputStream(outputBuffer)
+      Thread t2 = p.consumeProcessOutputStream(System.err)
+      int exitCode = p.waitFor()
+      try { t1.join(); } catch(Exception e) {}
+      try { t2.join(); } catch(Exception e) {}
+      if(exitCode != 0)
+          throw new PipelineError("Command $cmd failed with error $exitCode")
       return outputBuffer.toString()
     }
     
@@ -1428,11 +1602,36 @@ class PipelineContext {
         async(cmd, true, config)
     }
     
-    class CommandThread extends Thread {
-        int exitStatus = -1
-        CommandExecutor toWaitFor
+    static int EXIT_ABORTED = -2i
+    
+    class CommandThread extends Thread implements ResourceRequestor {
+        Command toWaitFor
+        PipelineTestAbort abort
+        Pipeline pipeline
         void run() {
-            exitStatus = toWaitFor.waitFor()
+            Pipeline.currentRuntimePipeline.set(pipeline)
+            Concurrency.instance.registerResourceRequestor(this)
+            try {
+                log.info "CommandThread entering command waitFor (executor=" + toWaitFor.executor.class.name + ")"
+                toWaitFor.exitCode = toWaitFor.executor.waitFor()
+            }
+            catch(PipelineTestAbort e) {
+                abort = e 
+                toWaitFor.exitCode = EXIT_ABORTED
+            } 
+            finally {
+                log.info "Exiting command thread " + this + ", unregistering resource requestor"
+                Concurrency.instance.unregisterResourceRequestor(this)
+            }
+        }
+        
+        @Override
+        public boolean isBidding() {
+            return true;
+        }
+        
+        void writeLog() {
+            CommandLog.cmdLog.write(toWaitFor.command)
         }
     }
     
@@ -1461,6 +1660,13 @@ class PipelineContext {
      */
     void multiExec(List cmds) {
         
+        // When the list is a Map it means the user used the syntax
+        // multi foo:"some command", bar:"some other command"
+        // which is how to assign a configuration to each command
+        if(cmds[0] instanceof Map) {
+            cmds = cmds[0].collect { it } 
+        }
+        
         // Each command will be assumed to use the full value of the currently
         // specified resource usage. This is unintuitive, so we scale them to achieve
         // the expected effect: the total used by all the commands will be equal 
@@ -1474,43 +1680,73 @@ class PipelineContext {
         log.info "Scaled resource use to ${usedResources.values()} to execute in multi block"
         
         try {
-          def aborts = []
-          List<CommandExecutor> execs = cmds.collect { 
-              try {
-                async(it,true,null,true).executor 
+          List<Command> execCmds = cmds.collect { cmd -> 
+              // Could be map entry or direct string
+              if(cmd instanceof Map.Entry) {
+                  Utils.box(cmd.value).collect { nestedCommand ->
+                      async(nestedCommand,true,cmd.key,true) 
+                  }
               }
-              catch(PipelineTestAbort e) {
-                 aborts << e 
+              else {
+                  async(cmd,true,null,true) 
               }
-          }
-          
-          if(aborts) {
-              throw new PipelineTestAbort("Would execute multiple commands: \n\n" + [ 1..aborts.size(),aborts.collect { it.message.replaceAll("Would execute:","") }].transpose()*.join("\t").join("\n"))
-          }
+           }.flatten()
           
           List<Integer> exitValues = []
-          List<CommandThread> threads = execs.collect { new CommandThread(toWaitFor:it) }
+          List<CommandThread> threads = execCmds.collect { new CommandThread(toWaitFor:it, pipeline:Pipeline.currentRuntimePipeline.get()) }
           threads*.start()
           
-          while(true) {
-              int stillRunning = threads.count { it.exitStatus == -1 }
+         if(!Runner.opts.t && !probeMode) {
+              // Wait for them to have resources allocated
+              long waitTimeMs = 0
+              while(execCmds.any { !it.resourcesSatisfied }) {
+                  Thread.sleep(100)
+                  waitTimeMs += 100
+                  if(waitTimeMs > 10000 && waitTimeMs % 5000 == 0) {
+                      log.info "Waiting for thread allocation in multi block: " + execCmds.count { it.allocated } + " allocated / " + execCmds.size() + " exitCodes = " + execCmds*.exitCode + " probeMode = " + probeMode
+                  }
+              }
+              
+              // Now we can log them to the command log, if they did not abort
+              threads.each { if(!it.abort) { it.writeLog() } }
+          }
+              
+          while(!probeMode) {
+              int stillRunning = threads.count { it.toWaitFor.exitCode == -1 }
               if(stillRunning) {
                   log.info "Waiting for $stillRunning commands in multi block"
               }
               else
                 break
+                
               Thread.sleep(2000)
           }
-         
-          List<String> failed = [cmds,threads*.exitStatus].transpose().grep { it[1] }
-          if(failed) {
-              throw new PipelineError("Command(s) failed: \n\n" + failed.collect { "\t" + it[0] + "\n\t(Exit status = ${it[1]})\n"}.join("\n"))
+          
+          List aborts = threads*.abort.grep { it != null }
+          if(aborts) {
+              throw new PipelineTestAbort("Would execute multiple commands: \n\n" + [ 1..aborts.size(),aborts.collect { it.message.replaceAll("Would execute:","") }].transpose()*.join("\t").join("\n"))
+          }
+          
+          if(probeMode) {
+              log.info "Not checking command success because probe mode"
+          }
+          else {
+              List<String> failed = [cmds,threads*.toWaitFor*.exitCode].transpose().grep { it[1] }
+              if(failed) {
+                  throw new PipelineError("Command(s) failed: \n\n" + failed.collect { "\t" + it[0] + "\n\t(Exit status = ${it[1]})\n"}.join("\n"))
+              }
           }
         }
         finally {
           this.usedResources = oldResources
         }
     }
+    
+    /**
+     * Regular expression for identifying string matching a range of integers,
+     * eg: 10 - 30
+     */
+    final static Pattern INT_RANGE_PATTERN = ~/([0-9]*) *- *([0-9]*)$/
      
     /**
      * Asynchronously executes the given command by creating a CommandExecutor
@@ -1538,28 +1774,39 @@ class PipelineContext {
       // after we have resolved the right thread / procs value
       Command command = new Command(command:joined, configName:config)
       
-      // Replacement of magic $thread variable with real value 
+      // Work out how many threads to request
       String actualThreads = this.usedResources['threads'].amount as String  
       
       // If the config itself specifies procs, it should override the auto-thread magic variable
       // which may get given a crazy high number of threads
-      if(config) {
-          def procs = command.getConfig(Utils.box(this.input)).procs
-          if(procs) {
-              if(procs instanceof String) {
-                 // Allow range of integers
-                 procs = procs.replaceAll(" *-.*\$","")
-              }
-              else
-              if(procs instanceof IntRange) {
-                  procs = procs.to
-              }
-              log.info "Found procs value $procs to override computed threads value of $actualThreads"
-              actualThreads = String.valueOf(Math.min(procs.toInteger(), actualThreads.toInteger()))
+      def commandCfg = command.getConfig(Utils.box(this.input))
+      String configThreads = null
+      if(commandCfg.containsKey('procs')) {
+          def procs = commandCfg.procs
+          int maxProcs = 0
+          if(procs instanceof String) {
+             // Allow range of integers
+             Matcher intRangeMatch = INT_RANGE_PATTERN.matcher(procs)
+             if(intRangeMatch) {
+                 procs = intRangeMatch[0][1].toInteger()
+                 maxProcs = intRangeMatch[0][2].toInteger()
+             }
+             else {
+                 // NOTE: currently SGE is using a procs option like
+                 // 'orte 3' for 3 processes. This here is a hack to enable
+                 // that not to fail, but we need to think about how to handle that better
+                 procs = procs.trim().replaceAll('[^0-9]','').toInteger()
+             }
           }
+          else
+          if(procs instanceof IntRange) {
+              maxProcs = procs.to
+              procs = procs.from
+          }
+          log.info "Found procs value $procs (maxProcs = $maxProcs) to override computed threads value of $actualThreads"
+          this.usedResources['threads'].amount = procs
+          this.usedResources['threads'].maxAmount = maxProcs
       }
-      
-      command.command = joined.replaceAll(THREAD_LAZY_VALUE, actualThreads)
       
       // Inferred outputs are outputs that are picked up through the user's use of 
       // $ouput.<ext> form in their commands. These are intercepted at string evaluation time
@@ -1573,52 +1820,130 @@ class PipelineContext {
       def actualResolvedInputs = Utils.box(this.@inputWrapper?.resolvedInputs) + internalInputs
 
       log.info "Checking actual resolved inputs $actualResolvedInputs"
-      if(!probeMode && checkOutputs && Dependencies.instance.checkUpToDate(checkOutputs,actualResolvedInputs)) {
-          String message
-          if(this.@input)
-              message = "Skipping command " + Utils.truncnl(joined, 30).trim() + " due to inferred outputs $checkOutputs newer than inputs ${this.@input}"
-          else
-              message = "Skipping command " + Utils.truncnl(joined, 30).trim() + " because outputs $checkOutputs already exist (no inputs referenced)"
-          
-          log.info message
-          msg message
-          
-          return new Command(executor:new ProbeCommandExecutor())
+      
+      List<String> outOfDateOutputs = null
+      if(probeMode) {
+          log.info "Skip check dependencies due to probe mode"
+      }
+      else
+      if(!checkOutputs) {
+          log.info "Skip check dependencies due to no outputs to check"
+      }
+      else {
+          outOfDateOutputs = Dependencies.instance.getOutOfDate(checkOutputs,actualResolvedInputs)
+          if(!outOfDateOutputs) {
+              return createUpToDateExecutor(command, checkOutputs)
+          }
       }
           
       // Reset the inferred outputs - once they are used the user should have to refer to them
       // again to re-invoke them
       this.inferredOutputs = []
       
-      if(!probeMode) {
-          CommandLog.cmdLog.write(command.command)
-          
-          // Check the command for versions of tools it uses
-          if(!Runner.opts.t) { // Don't execute probes if the user is just testing the pipeline
-            def toolsDiscovered = ToolDatabase.instance.probe(cmd)
-          
-            // Add the tools to our documentation
-            if(toolsDiscovered)
-                this.doc(["tools" : toolsDiscovered])
-          }
-
-          command.branch = this.branch
-          command.executor = 
-              commandManager.start(stageName, command, config, Utils.box(this.input), 
-                                   new File(outputDirectory), this.usedResources,
-                                   deferred, this.outputLog)
-          trackedOutputs[command.id] = command              
-          List outputFilter = command.executor.ignorableOutputs
-          if(outputFilter) {
-              this.outputMask.addAll(outputFilter)
-          }
-          return command
-      }
-      else {
+      if(probeMode) {
+          log.info("Skip command start for $command.command due to probe mode")
           return new Command(executor:new ProbeCommandExecutor())
+      } 
+      
+      // Check the command for versions of tools it uses
+      if(!Runner.opts.t) { // Don't execute tool probes if the user is just testing the pipeline
+        def toolsDiscovered = ToolDatabase.instance.probe(cmd)
+          
+        // Add the tools to our documentation
+        if(toolsDiscovered)
+            this.doc(["tools" : toolsDiscovered])
       }
+          
+
+      command.branch = this.branch
+      command.outputs = checkOutputs.unique()
+      command.stageId = this.pipelineStages[-1].id
+      try {
+          command = commandManager.start(stageName, command, config, Utils.box(this.input), 
+                                         this.usedResources,
+                                         deferred, this.outputLog)
+      }
+      catch(PipelineTestAbort exPta) {
+          exPta.missingOutputs = outOfDateOutputs
+          throw exPta
+      }
+      finally {
+          // If deferred then the thread count is not allocated yet, so we can't 
+          // write the log line yet
+          if(!deferred)
+              CommandLog.cmdLog.write(command.command)
+      }
+          
+      // log.info "Command $command.id started with resources " + this.usedResources
+          
+      trackedOutputs[command.id] = command              
+      List outputFilter = command.executor.ignorableOutputs
+
+      return command
     }
     
+    /**
+     * Create an executor for the command given its outputs appear newer than its 
+     * input. The executor may be a probe or the original executor if resume is
+     * specified.
+     * 
+     * @param m
+     */
+    Command createUpToDateExecutor(Command command, List checkOutputs) {
+      // If resuming, the input may be up to date but still in process of being created
+      if(Config.config.mode == "resume") {
+          if(waitForResumableOutputs(checkOutputs)) {
+              return new Command(executor:new ProbeCommandExecutor())
+          }
+      }
+          
+      String message
+      if(this.@input)
+          message = "Skipping command " + Utils.truncnl(command.command, 30).trim() + " due to inferred outputs $checkOutputs newer than inputs ${this.@input}"
+      else
+          message = "Skipping command " + Utils.truncnl(command.command, 30).trim() + " because outputs $checkOutputs already exist (no inputs referenced)"
+          
+      log.info message
+      msg message
+          
+      return new Command(executor:new ProbeCommandExecutor())
+    }
+    
+    /**
+     * Check if any of the given outputs are currently being created and if so,
+     * waits for their process to finish and throws an error if it fails.
+     * 
+     */
+    boolean waitForResumableOutputs(List boxedOutputs) {
+        List<String> boxedOutputPaths = boxedOutputs*.toString()
+        List<Command> commandsForMyOutputs = Runner.runningCommands.grep { cmd -> cmd.outputs?.any { it in boxedOutputPaths } }
+        if(!commandsForMyOutputs.isEmpty()) {
+            log.info "Resume will wait for commands ${commandsForMyOutputs*.id} that produce files overlapping with outputs $boxedOutputPaths"
+                
+            for(Command waitCommand in commandsForMyOutputs) {
+                msg "Resuming command ${waitCommand.id} in stage $stageName to create ${boxedOutputPaths.join(',')} ..."
+                outputLog.flush()
+                
+                CommandStatus waitCommandStatus = waitCommand.executor.status()
+                if(waitCommandStatus == CommandStatus.RUNNING) {
+                    // NOTE: race condition - command could finish right here - what to do?
+                    waitCommand.exitCode = waitCommand.executor.waitFor()
+                    this.commandManager.cleanup(waitCommand.id)
+                    if(waitCommand.exitCode != 0) {
+                        throw new PipelineError("Resumed command $waitCommand.id failed with error $waitCommand.exitCode:\n\n$waitCommand.command")
+                    }
+                }
+                else {
+                    log.info "Command $waitCommand.id in state $waitCommandStatus != RUNNING at time of wait: assume completed."
+                }
+            }
+            return true
+        }
+        else {
+            log.info "No running commands overlap outputs for stage $stageName"
+            return false
+        }
+    }
     
     /**
      * Write a message to the output of the current stage
@@ -1651,7 +1976,7 @@ class PipelineContext {
        
        log.info "From clause searching for inputs matching spec $exts"
        
-       if(!exts)
+       if(!exts || exts.every { it == null })
            throw new PipelineError("A call to 'from' was invoked with an empty or null argument. From requires a list of file patterns to match.")
        
        def orig = exts
@@ -1675,7 +2000,13 @@ class PipelineContext {
        // rather than searching backwards for a previous match
        reverseOutputs.add(0,Utils.box(this.@input))
        
-       log.info "Input list to check:  $reverseOutputs"
+       int outputCount = reverseOutputs*.size().sum()
+       if(outputCount<20) {
+           log.info "Input list to check:  $reverseOutputs"
+       }
+       else {
+           log.info "Input list to check has $outputCount entries (" + reverseOutputs[0].size() + ") in tier 1"
+       }
        
        exts = Utils.box(exts).collect { (it instanceof PipelineOutput || it instanceof PipelineInput) ? it.toString() : it }
        
@@ -1739,8 +2070,13 @@ class PipelineContext {
        
        log.info "Found inputs $resolvedInputs for spec $orig"
        
-       if(resolvedInputs.any { it == null})
-           throw new PipelineError("Stage $stageName unable to locate one or more inputs specified by 'from' ending with $orig")
+       List missingInputs = resolvedInputs.findIndexValues { it == null }
+       if(missingInputs) {
+           if(exts.size()>1)
+               throw new PipelineError("Stage $stageName unable to locate one or more inputs specified by 'from' ending with $orig\nMost likely missing extensions: ${exts[missingInputs]}")
+           else
+               throw new PipelineError("Stage $stageName unable to locate one or more inputs specified by 'from' ending with $orig")
+       }
            
        // resolvedInputs = Utils.unbox(resolvedInputs)
        resolvedInputs = resolvedInputs.flatten().unique()
@@ -1798,8 +2134,18 @@ class PipelineContext {
     */
     void forwardImpl(List values) {
        this.nextInputs = values.flatten().collect {
-           String.valueOf(it)
-       }
+           if(it instanceof MultiPipelineInput) {
+               it.input
+           }
+           else
+               String.valueOf(it)
+       }.flatten()
+       
+       log.info("Forwarding ${nextInputs.size()} inputs ${nextInputs}")
+   }
+    
+   Aliaser alias(def value) {
+       new Aliaser(this.aliases, String.valueOf(value))
    }
    
    /**
@@ -1807,7 +2153,7 @@ class PipelineContext {
     * @return
     */
    PipelineStage getCurrentStage() {
-       return this.stages[-1]
+       return this.pipelineStages[-1]
    }
    
     /**
@@ -1819,6 +2165,8 @@ class PipelineContext {
             UNCLEAN_FILE_PATH.mkdirs()
             
         this.uncleanFilePath = new File(UNCLEAN_FILE_PATH, String.valueOf(Thread.currentThread().id))   
+        if(uncleanFilePath.exists())
+            this.uncleanFilePath.delete()
         this.uncleanFilePath.text = ""
     }
     
@@ -1848,20 +2196,6 @@ class PipelineContext {
         }
             
         return false
-    }
-    
-    /**
-     * Return a {@link File} that indicates the path where
-     * metadata for the specified output & file should be stored.
-     * 
-     * @param outputFile The name of the output file
-     */
-    File getOutputMetaData(String outputFile) {
-        File outputsDir = new File(OUTPUT_METADATA_DIR)
-        if(!outputsDir.exists()) 
-            outputsDir.mkdirs()
-        
-        return  new File(outputsDir,this.stageName + "." + new File(outputFile).path.replaceAll("[/\\\\]", "_") + ".properties")
     }
     
     /**
@@ -1895,13 +2229,24 @@ class PipelineContext {
             }
             
             try {
-                this.usedResources['threads'].amount = Math.max((int)1, (int)maxThreads / childCount)
+                  // Old logic: divide by numer of branches - overly conservative
+                  // this.usedResources['threads'].amount = Math.max((int)1, (int)maxThreads / childCount)
+                  // The actual value is not resolved now until resources are negotiated inside Concurrency.allocateResources
+                
+                // Note the value 1 here is interpreted as "default" or "unset by the user" by 
+                // the ThrottledDelegatingCommandExecutor
+                this.usedResources['threads'].amount = 1
             }
             catch(Exception e) {
                 e.printStackTrace()
             }
         }
         return THREAD_LAZY_VALUE
+    }
+    
+    @CompileStatic
+    String getMemory() {
+        return MEMORY_LAZY_VALUE
     }
     
     /**
@@ -1983,6 +2328,8 @@ class PipelineContext {
             
         this.setDefaultOutput(this.@defaultOutput)
         
+        OutputDirectoryWatcher.getDirectoryWatcher(directoryName)
+        
         log.info "Output set to $directoryName (new default output = ${this.@defaultOutput})"
     }
     
@@ -2061,6 +2408,18 @@ class PipelineContext {
         new Sender(this).text(c)
     }
     
+    Sender json(Object obj) {
+        this.json({ obj })
+    }
+    
+    Sender json(Closure c) {
+        new Sender(this).json(c)
+    }
+    
+    Sender jms(Closure c) {
+        new Sender(this).json(c)
+    }
+    
     Sender report(String reportName) {
         new Sender(this).report(reportName)
     }
@@ -2070,11 +2429,15 @@ class PipelineContext {
     }
     
     Checker check(String name, Closure c) {
-        return new Checker(this,name, c)
+        Checker checker = new Checker(this,name, c)
+        this.checkers << checker
+        return checker
     }
     
     Checker check(Closure c) {
-        return new Checker(this,c)
+        Checker checker = new Checker(this,c)
+        this.checkers << checker
+        return checker
     }
     
     String output(String value) {
@@ -2088,6 +2451,136 @@ class PipelineContext {
         this.onNewOutputReferenced(null, value)
         this.@output = Utils.box(this.@output) + value
         return value
+    }
+    
+    /**
+     * Cleanup outputs matching the specified patterns from the current 
+     * file output hierarchy (ie: resolvable within current branch).
+     * <p>
+     * The list of patterns can contain Strings (or any object coerceable to a string)
+     * or it can contain regular expression Pattern objects (eg, created using ~"....")
+     * or a mixture of both. The Strings will be treated as file extensions, while the 
+     * patterns will be treated as end-matching patterns on the outputs visible to this 
+     * pipeline stage.
+     * 
+     * @param patterns
+     */
+    void cleanup(java.lang.Object... patterns) {
+        
+        // This is used as a way to resolve inputs correctly in the same way
+        // that we would look for inputs (following branch semantics)
+        PipelineInput inp = getInput()
+        
+        List<String> exts = patterns.grep { !(it instanceof Pattern) }.collect { val ->
+            val.toString()
+        }
+        
+        List results = []
+        if(exts) {
+            results = inp.resolveInputsEndingWith(exts)
+            log.info "Resolved upstream outputs matching $exts for cleanup : $results"
+        }
+        
+        List<String> pats = patterns.grep { (it instanceof Pattern) }.collect { val ->
+            val.toString()
+        }
+        
+        if(pats) {
+            List patResults = inp.resolveInputsEndingWithPatterns(pats, pats)
+            log.info "Resolved upstream outputs matching $pats for cleanup : $results"
+            results.addAll(patResults)
+        }
+        
+        log.info "Removing outputs that were aliased from cleanup targets: aliased = $aliases"
+        
+        results = results.grep { !aliases.isAliased(it) }
+        
+        // Finally, cleanup all these files
+        log.info "Attempting to cleanup files: $results"
+        if(results) {
+            
+            // Are there actually existing files matching the patterns? If not, we can avoid the 
+//            // expensive process of scanning the output folder for them
+//            int countMatches = OutputDirectoryWatcher.countGlobalGlobMatches(patterns.grep { it instanceof String }) +
+//                               OutputDirectoryWatcher.countGlobalPatternMatches(patterns.grep { it instanceof Pattern })
+//                
+//            if(countMatches == 0) {
+//                log.info "Skipping cleanup process because no files observed to match patters: $patterns"
+//                return
+//            }
+//            else {
+//                log.info "Estimate of files matching cleanup patterns is $countMatches"
+//            }
+//                               
+            List resultFiles = results.collect { new File(it) }
+            
+//            List<OutputMetaData> props = Dependencies.instance.scanOutputFolder()
+            
+            List<File> cleaned = []
+            for(File result in resultFiles) {
+                
+                // Note we protect attempt to resolve canonical path with 
+                // the file name equality because it is very slow!
+//                OutputMetaData resultProps = props.find { (it.outputFile.name == result.name) && (GraphEntry.canonicalPathFor(it) == result.canonicalPath) }
+                
+                GraphEntry graph = Dependencies.instance.outputGraph
+                Lock lock = Dependencies.instance.outputGraphLock.readLock()
+                OutputMetaData resultProps 
+                
+                lock.lock()
+                try {
+                    GraphEntry resultEntry = graph.entryFor(result)
+                    if(!resultEntry) {
+                        log.warning("Unable to find output graph entry for output file $result. Will not clean up this file.")
+                        continue
+                    }
+                    
+                   resultProps = resultEntry.values.find { it.outputPath = result.path }
+                }
+                finally {
+                    lock.unlock()
+                }
+                
+                if(resultProps == null) {
+                    log.warning "Unable to file matching known output $result.name"
+                    System.err.println("WARNING: unable to cleanup output $result because meta data file could not be resolved")
+                }
+                else
+                if(resultProps.cleaned) {
+                    log.info "File $result already cleaned"
+                }
+                else {
+                    Dependencies.instance.removeOutputFile(resultProps)
+                    cleaned.add(result)
+                }
+            }
+            
+            if(cleaned) {
+                println "MSG: The following files were cleaned: " + cleaned.join(",")
+            }
+        }
+    }
+    
+    String memory(Object memoryValue) {
+        int memoryAmountMB = Integer.parseInt(String.valueOf(memoryValue)) * 1000
+        this.usedResources["memory"] = 
+            new ResourceUnit(key:"memory", amount: memoryAmountMB, maxAmount: memoryAmountMB)
+        return String.valueOf(memoryValue)
+    }
+    
+    void setOutputDirectory(String outputDirectory) {
+        assert outputDirectory != null
+        this.@outputDirectory = outputDirectory
+    }
+    
+    void debug() {
+//        groovy.ui.Console console = new groovy.ui.Console();
+        console.setVariable("pipeline", bpipe.Pipeline.currentRuntimePipeline.get());
+        console.setVariable("context", this)
+        console.run()
+        while(console.frame.visible) {
+            Thread.sleep(1000);
+        }
     }
 }
 

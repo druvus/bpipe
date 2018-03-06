@@ -31,7 +31,7 @@ import groovy.util.logging.Log;
  * <p>
  * A "transform" means that the input(s) are processed to output a new kind
  * of file (eg: .bam file in, .csv out). By modeling the idea of transforms as a 
- * first calss concept, Bpipe can enforce a convention for how such 
+ * first class concept, Bpipe can enforce a convention for how such 
  * operations name their file: the output file has the same name as the 
  * input file. The "execute()" method models this logic as the default
  * behavior. However a more advanced behavior is offered that allows any
@@ -101,6 +101,10 @@ class TransformOperation {
         
         this.body = c
         
+        // Save original files: we need them later in case they were different
+        // from those implied by previous stages (eg: modified by 'from')
+        List originalFiles = this.files
+        
         // We are going to re-resolve the files to use based on the 
         // from patterns (which are stored in exts)
         this.files = []
@@ -117,17 +121,18 @@ class TransformOperation {
         // they map to, we repeat the last one to fill up the missing ones
         if(exts.size() < toPatterns.size()) {
             exts = exts.clone()
-            while(exts.size() < toPatterns.size())
+            while(exts.size() < toPatterns.size()) {
               exts.add( exts[-1] )
+            }
         }
-		
-		// Similarly, if there are not enough to patterns, fill them up from
-		// the first to pattern
-		if(toPatterns.size() < exts.size()) {
-			toPatterns = toPatterns.clone()
-			while(toPatterns.size() < exts.size())
-				toPatterns.add(toPatterns[-1])
-		}
+        
+        // Similarly, if there are not enough to patterns, fill them up from
+        // the first to pattern
+        if(toPatterns.size() < exts.size()) {
+            toPatterns = toPatterns.clone()
+            while(toPatterns.size() < exts.size())
+                toPatterns.add(toPatterns[-1])
+        }
         
         // In the advanced case, the "file extensions" are not file extensions, but
         // regular expressions for matching files to transform from
@@ -140,13 +145,23 @@ class TransformOperation {
             if(!pattern.endsWith('$'))
                 pattern += '$'
                 
-            PipelineInput input = new PipelineInput(this.files, this.ctx.pipelineStages)
+            PipelineInput input = new PipelineInput(originalFiles, this.ctx.pipelineStages, this.ctx.aliases)
             List<String> filesResolved = input.resolveInputsEndingWithPatterns([fromPattern + '$'], [fromPattern])
-            this.files.addAll(filesResolved)
-            
-            // Add a from pattern for every file that was resolved
-            fromPatterns.addAll([fromPattern] * filesResolved.size())
-            expandedToPatterns.addAll([toPattern] * filesResolved.size())
+            if(isGlobPattern(fromPattern)) {
+                
+                this.files.addAll(filesResolved)
+                
+                // Add a from pattern for every file that was resolved
+                fromPatterns.addAll([fromPattern[1..-1]] * filesResolved.size())
+                expandedToPatterns.addAll([toPattern] * filesResolved.size())
+            }
+            else {
+                if(filesResolved) {
+                    this.files.add(filesResolved[0])
+                    fromPatterns.add(fromPattern)
+                    expandedToPatterns.add(toPattern)
+                }
+            }
         }
         
         // Replace the original list of from patterns with our expanded list
@@ -163,7 +178,35 @@ class TransformOperation {
      * with those set in the constructor by {@link #exts}.
      */
     void execute(List<String> fromPatterns = ['\\.[^\\.]*$'], List<String> providedToPatterns = null) {
-        def extensionCounts = [:]
+        
+        Pipeline pipeline = Pipeline.currentRuntimePipeline.get()
+        
+        def outFiles = computeOutputFiles(ctx.applyName ? pipeline.name : null, ctx.stageName, fromPatterns, providedToPatterns)
+        
+        log.info "Transform using $exts produces outputs $outFiles"
+        
+        if(ctx.applyName)
+            pipeline.nameApplied = true
+           
+        ctx.checkAccompaniedOutputs(files)
+            
+        // Coerce any inputs coming from different folders to the correct output folder
+        outFiles = ctx.toOutputFolder(outFiles)
+        
+        if(providedToPatterns) {
+            ctx.withInputs(this.files) {
+                ctx.produceImpl(outFiles, body)
+            }
+        }
+        else 
+            ctx.produceImpl(outFiles, body)
+    }
+    
+    /**
+     * Compute a list of expected output file names from this transform's input files (files attribute)
+     */
+    List<String> computeOutputFiles(String applyBranchName, String stageName, List<String> fromPatterns = ['\\.[^\\.]*$'], List<String> providedToPatterns = null) {
+        Map extensionCounts = [:]
         for(def e in exts) {
             extensionCounts[e] = 0
         }
@@ -175,14 +218,14 @@ class TransformOperation {
               throw new PipelineError("Expected input but no input could be resolved matching pattern ${fromPatterns[0]}")
         }
         
-        def pipeline = Pipeline.currentRuntimePipeline.get()
+        Pipeline pipeline = Pipeline.currentRuntimePipeline.get()
         
         // If the pipeline branched, we need to add a segment to the new files name
         // to differentiate it from other parallel branches
         String additionalSegment = ""
-        if(ctx.applyName) {
-            additionalSegment = '.'+pipeline.name 
-            log.info "Applying branch name $pipeline.name to pipeline segment because name is yet to be applied"
+        if(applyBranchName != null) {
+            additionalSegment = '.'+applyBranchName
+            log.info "Applying branch name $applyBranchName to pipeline segment because name is yet to be applied"
         }
         
         int count = 0
@@ -221,7 +264,7 @@ class TransformOperation {
             // A small hack that is designed to avoid a situation where an output 
             // receives the same name as an input file
             if(txed in files) {
-                txed = txed.replaceAll('\\.'+extension+'$', '.'+FastUtils.dotJoin(ctx.stageName,extension))
+                txed = txed.replaceAll('\\.'+extension+'$', '.'+FastUtils.dotJoin(stageName,extension))
             }
             
             if(txed.startsWith("."))
@@ -230,23 +273,17 @@ class TransformOperation {
             ++count
             return txed
         }
-        
-        log.info "Transform using $exts produces outputs $outFiles"
-        
-        if(ctx.applyName)
-            pipeline.nameApplied = true
-            
-        ctx.checkAccompaniedOutputs(files)
-            
-        // Coerce any inputs coming from different folders to the correct output folder
-        outFiles = ctx.toOutputFolder(outFiles)
-        
-        if(providedToPatterns) {
-            ctx.withInputs(this.files) {
-                ctx.produceImpl(outFiles, body)
-            }
-        }
-        else 
-            ctx.produceImpl(outFiles, body)
+        return outFiles
+    }
+    
+    /**
+     * Return true if the extension given is a wildcard type expression that could
+     * match multiple files.
+     * @param ext
+     * @return
+     */
+    boolean isGlobPattern(ext) {
+        boolean result = ext instanceof String && ext.startsWith('*.')
+        return result
     }
 }

@@ -44,45 +44,27 @@ tmsg() {
 }
 
 #----------------------------------------------------------
-# Kill a whole tree of processes in a cross platform way.
-# Note, in some situations killing the parent process is 
-# sufficient ot kill the children, however this doesn't
-# happen universally, so this function actually recursively
-# calls itself to iterate all child processes and kill them
+# A variety of commands run in the foreground. These can be 
+# launched in a simpler manner than running a pipeline, which
+# needs to run in the background. The "launch mode" is the
+# command that is to be run, the Bpipe Runner interprets this
+# system property (bpipe.mode) to decide what to run.
 #----------------------------------------------------------
-killtree() {
-    local ppid=$1
-    
-    # Sadly Mac OS/X does not seem to support --ppid option in default version
-    # of ps
-    if uname | grep -q Darwin;
-    then
-        pids=`ps -o pid,ppid | grep '^[0-9]' | grep ' '$ppid | cut -f 1 -d ' '`
-    elif uname | grep -iq cygwin;
-    then
-        pids=`ps -f  | awk '{ if(NR>1) print  $2 " " $3 }' | grep ' '$ppid | cut -f 1 -d ' '`
-    else
-        pids=$(ps -o pid --no-headers --ppid ${ppid})
-    fi
-    
-    if [ ! -z "$pids" ];
-    then
-        for child_pid in ${pids}; 
-        do
-            killtree ${child_pid}
-        done
-    fi
-    
-    # If second arg supplied, wait before killing parent
-    # this allows Bpipe itself to notice its children are dead
-    # by itself.
-    if [ ! -z "$2" ];
-    then
-        sleep $2
-    fi
-    
-    kill -TERM ${ppid} > /dev/null 2>&1
+launch_in_foreground() {
+    LAUNCH_MODE="$1"
+    shift 1
+    exec java -Xmx${MAX_JAVA_MEM} \
+             -noverify \
+              -classpath "$CP" \
+              $BPIPEDEBUG \
+              -Dbpipe.home="$JVM_BPIPE_HOME" \
+              -Dbpipe.mode=$LAUNCH_MODE \
+              org.codehaus.groovy.tools.GroovyStarter \
+              --classpath "$CP" \
+              --main bpipe.Runner $*
+    exit
 }
+
 
 #----------------------------------------------------------
 # Create a file containing the PID of the Java process
@@ -111,7 +93,7 @@ get_last_run_pid() {
     then
       LAST_PID="-1"
     else
-      LAST_PID=`ls -tc .bpipe/jobs/* | head -1 | xargs basename`
+      LAST_PID=`ls -t .bpipe/jobs/* | head -1 | xargs basename`
     fi
 }
 
@@ -132,7 +114,7 @@ is_running() {
     fi
 
     # Has been run, is it finished?
-    kill -0 $LAST_PID > /dev/null 2>&1
+    kill -0 $LAST_PID > /dev/null 2>&1 || [ -e /proc/$LAST_PID ]
 }
 
 #----------------------------------------------------------
@@ -177,30 +159,33 @@ cleanup() {
     then
       for ip in .bpipe/inprogress/* ;
       do
-          echo "Cleaning up files from context $ip"
-          for f in `cat $ip`;
-          do
-              if [ -e "$f" ];
-              then
-                  target=".bpipe/trash/$f"
-                  if [ ! -d .bpipe/trash ];
+          if [ `wc -l $ip | awk '{ print $1}'` -ne 0 ];
+          then
+              echo "Cleaning up files from context $ip"
+              for f in `cat $ip`;
+              do
+                  if [ -e "$f" ];
                   then
-                      mkdir -p .bpipe/trash
+                      target=".bpipe/trash/$f"
+                      if [ ! -d .bpipe/trash ];
+                      then
+                          mkdir -p .bpipe/trash
+                      fi
+                      count=1
+                      realtarget="`basename $target`"
+                      while [ -e "$realtarget" ];
+                      do
+                        realtarget="${target}.${count}"
+                        let "count = count + 1"
+                      done
+                      target="$realtarget"
+                      echo "Moving unclean file $f to $target"
+                      echo
+                      mv "$f" ".bpipe/trash/$f"
                   fi
-                  count=1
-                  realtarget="$target"
-                  while [ -e "$realtarget" ];
-                  do
-                    realtarget="${target}.${count}"
-                    let "count = count + 1"
-                  done
-                  target="$realtarget"
-                  echo "Moving unclean file $f to $target"
-                  echo
-                  mv "$f" ".bpipe/trash/$f"
-              fi
-              rm $ip
-          done
+                  rm $ip
+              done
+          fi
       done
     fi
 }
@@ -219,11 +204,15 @@ function handle_sigint() {
         then
             echo
             echo "Terminating process $BPIPE_PID ..."
-            killtree $BPIPE_PID
+            
+            kill -TERM ${BPIPE_PID} > /dev/null 2>&1
 
             # Don't carry on until Bpipe actually finishes
             wait $BPIPE_PID > /dev/null 2>&1
             echo 
+            echo "Running stop command ..."
+            java -Xmx${MAX_JAVA_MEM} -classpath "$CP" -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=stopcommands bpipe.Runner
+            echo
             cleanup
         fi
     fi
@@ -264,7 +253,7 @@ get_classpath() {
   # bpipe classes with those from the build directory and the eclipse compile path
   if [ -e $BPIPE_HOME/build/classes/main ] || [ -e $BPIPE_HOME/eclipse-build ];
   then
-    CP="$BPIPE_HOME/eclipse-build:$BPIPE_HOME/build/classes/main:$CP"
+    CP="$BPIPE_HOME/eclipse-build:$BPIPE_HOME/build/classes/main:$CP:$BPIPE_HOME/build/libs/bpipe.jar"
   fi
 
   # Support for Cygwin: convert the class path to windows format 
@@ -298,7 +287,8 @@ print_jobs() {
                     # Since the process is not running, it was 
                     # probably hard killed somehow, so 
                     # just clean up the file quietly 
-                    rm -f ~/.bpipedb/jobs/$base
+                    mkdir -p ~/.bpipe/completed
+                    mv ~/.bpipedb/jobs/$base ~/.bpipedb/completed/$base
                     rm -f .bpipe/jobs/$base
                  fi
              else
@@ -331,11 +321,9 @@ display_log() {
         TERM_HEIGHT=80
     fi
 
-    # Note that the log is not named with the PID of the Java process (unfortunately) but rather
-    # with the PID of the shell script that started it.  Therefore we have to 
-    # list files to find the 'most recent' log.
-    # TODO: for consistency / sanity should try to change this
-    LOG_ID=`ls -tc .bpipe/logs/*.log | grep -v 'bpipe\.' | grep '[0-9]' | head -1 | grep -o '[0-9]*.log$' | sed 's/[^0-9]//g'`
+    get_last_run_pid
+    
+    LOG_ID=$LAST_PID
     
     if is_running ;
     then
@@ -343,12 +331,7 @@ display_log() {
         TAIL_ROWS=$TERM_HEIGHT
     else
         let 'TAIL_ROWS=TERM_HEIGHT-7'
-        echo ""
-        echo "MSG: vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
-        echo "MSG:     NOTE: Pipeline completed as process $LAST_PID.  Trailing lines follow."
-        echo "MSG:     Use bpipe log -n <lines> to see more lines"
-        echo "MSG: ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
-        echo ""
+        COMPLETED_MSG="-x $LAST_PID"
     fi
     
     if echo "$*" | grep -q '\-n' ;
@@ -359,7 +342,7 @@ display_log() {
     fi
    
     #$THREAD_EXPR .bpipe/logs/$LOG_ID.log | sed -u "$TAIL_PATTERN" |  tail $ROWS_OPT $TAIL_OPT $* 
-    java -Xmx${MAX_JAVA_MEM} -classpath "$CP"  $BPIPEDEBUG -Dbpipe.home="$JVM_BPIPE_HOME" bpipe.Tail $ROWS_OPT $TAIL_OPT $* $LOG_ID
+    java -Xmx${MAX_JAVA_MEM} -classpath "$CP"  $BPIPEDEBUG -Dbpipe.home="$JVM_BPIPE_HOME" bpipe.Tail $ROWS_OPT $TAIL_OPT $COMPLETED_MSG $* $LOG_ID
 }
 
 #----------------------------------------------------------
@@ -368,7 +351,7 @@ display_log() {
 # symbolic link on OSX.
 #----------------------------------------------------------
 function python_readlink() {
-    python -c 'import os,sys; print os.path.realpath(sys.argv[1])' "$1"
+    python -c 'from __future__ import print_function;import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
 }
 
 #----------------------------------------------------------
@@ -405,6 +388,9 @@ function set_bpipe_home() {
 # Resolve the home directory for Bpipe
 set_bpipe_home
 
+# Source the utility scripts from Bpipe dir
+source $BPIPE_HOME/bin/bpipe-utils.sh
+
 # Default directory for pipes - user can override by setting BPIPE_LIB themselves
 : ${BPIPE_LIB:="$HOME/bpipes"}
 
@@ -438,49 +424,54 @@ then
         echo
     fi
     exit
-elif [ "$COMMAND" == "cleanup" ];
+elif [ "$COMMAND" == "cleanup" ] || \
+         [ "$COMMAND" == "register" ] || \
+         [ "$COMMAND" == "status" ] || \
+         [ "$COMMAND" == "query" ] || \
+         [ "$COMMAND" == "preserve" ] || \
+         [ "$COMMAND" == "preallocate" ] || \
+         [ "$COMMAND" == "stats" ] || \
+         [ "$COMMAND" == "install" ] || \
+         [ "$COMMAND" == "diagram" ] || \
+         [ "$COMMAND" == "diagrameditor" ]  || \
+         [ "$COMMAND" == "jobs" ]  || \
+         [ "$COMMAND" == "documentation" ];
 then
-    shift 1
-    exec java -Xmx${MAX_JAVA_MEM} -classpath "$CP" $BPIPEDEBUG -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=cleanup bpipe.Runner $* 
-elif [ "$COMMAND" == "status" ];
-then
-    shift 1
-    exec java -Xmx${MAX_JAVA_MEM} -classpath "$CP"  $BPIPEDEBUG -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=status bpipe.Runner $* 
-elif [ "$COMMAND" == "query" ];
-then
-    shift 1
-    exec java -Xmx${MAX_JAVA_MEM} -classpath "$CP"  $BPIPEDEBUG -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=query bpipe.Runner $* 
-elif [ "$COMMAND" == "preserve" ];
-then
-    shift 1
-    exec java -Xmx${MAX_JAVA_MEM} -classpath "$CP"  $BPIPEDEBUG -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=preserve bpipe.Runner $* 
-elif [ "$COMMAND" == "diagram" ];
-then
-    shift 1
-    java -Xmx${MAX_JAVA_MEM} -classpath "$CP" -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=diagram bpipe.Runner $* 
-    exit
-#elif [ "$COMMAND" == "documentation" ];
-#then
-#    shift 1
-#    java -Xmx${MAX_JAVA_MEM} -classpath "$CP" -Dbpipe.mode=documentation bpipe.Runner $* 
-#    exit
-elif [ "$COMMAND" == "diagrameditor" ];
-then
-    shift 1
-    java -Xmx${MAX_JAVA_MEM} -classpath "$CP" -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=diagrameditor bpipe.Runner $* 
-    exit
+    launch_in_foreground $*
 elif [ "$COMMAND" == "log" ];
 then
     shift 1
     display_log $*
     exit
+elif [ "$COMMAND" == "errors" ];
+then
+    shift 1
+    display_log -e $*
+    exit
+elif [ "$COMMAND" == "pause" ];
+then
+    get_last_run_pid
+    
+    echo
+    echo "Stopping Bpipe process $LAST_PID while leaving commands running."
+    echo
+    echo "Note: Bpipe will continue as idle process until commands finish."
+    echo
+    touch .bpipe/pause # creation of this file is noticed by Bpipe Java process
+    exit 0
+    
 elif [ "$COMMAND" == "stop" ];
 then
     shift 1
 
     # Stop any commands that must be stopped by a custom resource
     # manager (non-local commands)
-    java -Xmx${MAX_JAVA_MEM} -classpath "$CP" -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=stopcommands bpipe.Runner
+    java -Xmx${MAX_JAVA_MEM} -classpath "$CP" -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=stopcommands bpipe.Runner $*
+    
+    if [ "$1" == 'preallocated' ];
+    then 
+        exit 0
+    fi
     
     # Find all the process ids and kill it
     get_last_run_pid
@@ -495,10 +486,10 @@ then
       echo
       echo "Killing job $LAST_PID"
       echo
-      killtree $LAST_PID 5
-    else
-      echo
-      echo "Job $LAST_PID appears to be finished"
+      
+      kill -TERM ${LAST_PID} > /dev/null 2>&1
+      
+     else
       echo
     fi
 
@@ -510,14 +501,15 @@ then
     exit 
 elif [ "$COMMAND" == "checks" ];
 then
-    java -Xmx${MAX_JAVA_MEM} -classpath "$CP" -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=showchecks bpipe.ChecksCommand
+    shift 1
+    java -Xmx${MAX_JAVA_MEM} $BPIPEDEBUG -classpath "$CP" -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=showchecks bpipe.ChecksCommand "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
     exit
 elif [ "$COMMAND" == "override" ];
 then
     shift 1
-    java -Xmx${MAX_JAVA_MEM} -classpath "$CP" -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=showchecks bpipe.ChecksCommand -o $*
+    java -Xmx${MAX_JAVA_MEM} $BPIPEDEBUG -classpath "$CP" -Dbpipe.home="$JVM_BPIPE_HOME" -Dbpipe.mode=showchecks bpipe.ChecksCommand -o $*
     exit
-elif [ "$COMMAND" == "jobs" ];
+elif [ "$COMMAND" == "oldjobs" ];
 then
     print_jobs
     exit
@@ -543,6 +535,12 @@ then
       fi
     fi
     shift 1
+elif [ "$COMMAND" == "agent" ];
+then
+    shift 1
+    MODEFLAG="-Dbpipe.mode=agent"
+    COMMAND="run"
+    launch_in_foreground agent $*
 elif [ "$COMMAND" == "test" ];
 then
     shift 1
@@ -553,6 +551,16 @@ then
     shift 1
     COMMAND="run"
     MODEFLAG="-Dbpipe.mode=retry"
+elif [ "$COMMAND" == "remake" ];
+then
+    shift 1
+    COMMAND="run"
+    MODEFLAG="-Dbpipe.mode=remake" 
+elif [ "$COMMAND" == "resume" ];
+then
+    shift 1
+    COMMAND="run"
+    MODEFLAG="-Dbpipe.mode=resume"
 elif [ "$COMMAND" == "execute" ];
 then
     shift 1
@@ -575,6 +583,8 @@ tmsg " Starting"
 # Don't keep history if no arguments provided
 if [ ! -z "$*" ] && [ "$COMMAND" != "retry" ];
 then
+    # Note: delete explicitly because permissions may allow delete but not overwrite
+    rm -f .bpipe/lastcmd
     echo "$0 $COMMAND $*" > .bpipe/lastcmd &
     
     # Used to append to history here, but now the Java code does it
@@ -603,9 +613,36 @@ done
 # have java launch with its standard output captured to a log
 # file that contains its own PID.  
 tmsg " Launching Java"
-nohup echo 'printf $$ > .bpipe.'$LAUNCHER_PID'.run.pid &
-      exec java -Xmx'${MAX_JAVA_MEM}' -noverify -classpath "'"$CP"'" '$BPIPEDEBUG' '$MODEFLAG' -Dbpipe.pid='$LAUNCHER_PID' -Dbpipe.home='"$JVM_BPIPE_HOME"' -Dbpipe.version='$VERSION' -Dbpipe.builddate='$BUILDDATE' org.codehaus.groovy.tools.GroovyStarter --classpath "'"$CP"'" --main bpipe.Runner '$TESTMODE' '$BPIPE_ARGS' > .bpipe/logs/$$.log 2>&1' \
-     2>&1 | bash - > /dev/null 2>&1 &
+
+# Disable wildcard expansion, in case the user supplied arguments 
+# containing escaped '*' or other wildcards that they intended
+# to pass through to Bpipe
+set -f
+
+LAUNCH_CMD='
+   printf $$ > .bpipe.'$LAUNCHER_PID'.run.pid &
+   exec java -Xmx'${MAX_JAVA_MEM}' \
+             -noverify \
+             -classpath "'"$CP"'" '$BPIPEDEBUG' '$MODEFLAG' \
+             -Dbpipe.pid='$LAUNCHER_PID' \
+             -Dbpipe.home='"$JVM_BPIPE_HOME"' \
+             -Dbpipe.version='$VERSION' \
+             -Dbpipe.builddate='$BUILDDATE' \
+                 org.codehaus.groovy.tools.GroovyStarter \
+                    --classpath "'"$CP"'" \
+                    --main bpipe.Runner '$TESTMODE' '$BPIPE_ARGS' > .bpipe/logs/$$.log 2>&1
+'
+
+$SHOWDEBUG && {
+    echo "LAUNCH_CMD: $LAUNCH_CMD"
+}
+
+nohup bash -c "$LAUNCH_CMD" \
+    > /dev/null 2>&1 &
+
+# Re-enable wildcard expansion: don't want it turned off in case it's 
+# needed somewhere else in this script
+set +f
 
 tmsg " Waiting for pid to be created"
 while [ ! -e .bpipe.$LAUNCHER_PID.run.pid ];
@@ -642,7 +679,8 @@ echo "$0 $COMMAND $*" >> .bpipe/jobs/$BPIPE_PID
 
 # Save the job in the user's home .bpipe folder - this allows the user to query
 # what jobs they have running from anywhere
-# Note that it is up to the Java code to remove this when it shuts down
+# Note that the Java code moves this to the .bpipedb/completed directory when 
+# the job completes
 (
     if [ ! -e .bpipedb/jobs ];
     then
@@ -693,12 +731,20 @@ then
       tail $LOGFILE | sed "$TAIL_PATTERN"
     fi
 else
-    (tail -f $LOGFILE | sed -l "$TAIL_PATTERN") &
+    # (tail -f $LOGFILE | sed -l "$TAIL_PATTERN") &
+    
+    (java -Xmx64m -classpath "$CP"  -Dbpipe.home="$JVM_BPIPE_HOME" bpipe.Tail -f $BPIPE_PID ) &
+    
     TAIL_PID="$!"
-    #echo "DEBUG:  tailing log using MacOSX pid tracking emulation RUNPID=$$, BPIPE_PID=$BPIPE_PID TAILPID=$TAIL_PID"
+    
+    # echo "DEBUG:  tailing log using MacOSX pid tracking emulation RUNPID=$$, BPIPE_PID=$BPIPE_PID TAILPID=$TAIL_PID"
 
     # Wait for the Java Bpipe process to finish naturally (not Ctrl-C, see above for that)
     wait $BPIPE_PID
+    
+    # echo "Now killing tail: $TAIL_PID"
+    
+    sleep 1
 
     # Seems like The Java Bpipe process ended by itself: kill the background tail process 
     # started above
@@ -718,3 +764,12 @@ To run with all files in the local directory as input, use:
 fi
 
 clean_job_files
+
+# Use grep -q as the last command to cause this script to return an exit code
+# reflecting whether the run succeeded or not
+# Make sure this stays as the LAST command in this script
+if [ -e .bpipe/results/$BPIPE_PID.xml ];
+then
+    grep -q '<succeeded>true</succeeded>' .bpipe/results/$BPIPE_PID.xml
+fi
+

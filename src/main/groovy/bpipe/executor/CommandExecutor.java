@@ -24,9 +24,6 @@
  */
 package bpipe.executor;
 
-import groovy.lang.Closure;
-
-import java.io.File;
 import java.io.Serializable;
 import java.util.List;
 import java.util.Map;
@@ -50,7 +47,27 @@ import bpipe.Command;
  */
 public interface CommandExecutor extends Serializable {
     
-    void start(Map cfg, Command cmd, File outputDirectory);
+    /**
+     * Convenience constant for executors that need to capture output by forwarding to a file
+     */
+    static String CMD_OUT_FILENAME = "cmd.out";
+
+    /**
+     * Convenience constant for executors that need to capture output by forwarding to a file
+     */
+    static String CMD_ERR_FILENAME = "cmd.err";
+    
+    /**
+     * Convenience constant for executors that need to capture exit code to a file
+     */
+    static String CMD_EXIT_FILENAME = "cmd.exit";
+    
+    /**
+     * The file name of the script containing the actual command that should be executed.
+     */
+    static String CMD_FILENAME = "cmd_run.sh";
+
+    void start(Map cfg, Command cmd, Appendable outputLog, Appendable errorLog);
     
     String status();
     
@@ -59,6 +76,8 @@ public interface CommandExecutor extends Serializable {
     void stop();
     
     void cleanup();
+    
+    String statusMessage(); 
     
     /**
      * Return a list of outputs that should be ignored in terms of 

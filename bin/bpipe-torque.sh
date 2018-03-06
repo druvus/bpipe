@@ -45,7 +45,7 @@ QSUB_FAILED=7              # qsub command returned non-zero exit status
 MKDIR_JOBDIR_FAILED=8      # mkdir $JOBDIR failed
 
 ESSENTIAL_ENV_VARS="COMMAND NAME"
-OPTIONAL_ENV_VARS="WALLTIME PROCS QUEUE JOBDIR MEMORY"
+OPTIONAL_ENV_VARS="WALLTIME PROCS QUEUE JOBDIR MEMORY CUSTOM_SUBMIT_OPTS"
 DEFAULT_BATCH_MEM=1
 DEFAULT_BATCH_PROCS=1
 DEFAULT_WALLTIME="01:00:00" # one hour
@@ -121,12 +121,33 @@ make_pbs_script () {
         account="#PBS -A $ACCOUNT"
    fi
 
+   # allow specification of mb, gb or none
+   if [[ $MEMORY == *gb ]] || [[ $MEMORY == *GB ]] || [[ $MEMORY == *G ]] || [[ $MEMORY == *g ]];
+   then
+    	MEMORY=${MEMORY%gb}
+    	MEMORY=${MEMORY%g}
+    	MEMORY=${MEMORY%G}
+    	MEMORY=${MEMORY%GB}
+    	MEM_UNIT="gb"
+   elif [[ $MEMORY == *mb ]] || [[ $MEMORY == *MB ]] || [[ $MEMORY == *M ]] || [[ $MEMORY == *m ]];
+   then
+    	MEMORY=${MEMORY%mb}
+    	MEMORY=${MEMORY%m}
+    	MEMORY=${MEMORY%M}
+    	MEMORY=${MEMORY%MB}
+    	MEM_UNIT="mb"
+   else
+        MEM_UNIT="gb" # default is to assume GB
+   fi
+
    # handle the batch and smp queues specially with regards to memory and procs
    case $QUEUE in
-      batch) if [[ -z $MEMORY ]]; then
-                memory_request="#PBS -l pvmem=${DEFAULT_BATCH_MEM}gb"
+      batch) 
+             : ${MEM_PARAM:=pvmem}
+             if [[ -z $MEMORY ]]; then
+                memory_request="#PBS -l $MEM_PARAM=${DEFAULT_BATCH_MEM}gb"
              else
-                memory_request="#PBS -l pvmem=${MEMORY}gb"
+                memory_request="#PBS -l $MEM_PARAM=${MEMORY}${MEM_UNIT}"
              fi
              if [[ -z $PROCS ]]; then
                 set_procs $DEFAULT_BATCH_PROCS
@@ -136,7 +157,8 @@ make_pbs_script () {
       smp)   if [[ -z $MEMORY ]]; then
                 memory_request=""
              else
-                memory_request="#PBS -l mem=${MEMORY}gb" 
+                : ${MEM_PARAM:=mem}
+                memory_request="#PBS -l $MEM_PARAM=${MEMORY}${MEM_UNIT}" 
              fi
              # the SMP queue never requests cores (it gets a single node)
              procs_request="";;
@@ -144,7 +166,8 @@ make_pbs_script () {
        *)    if [[ -z $MEMORY ]]; then
                 memory_request=""
              else
-                memory_request="#PBS -l mem=${MEMORY}gb" 
+                : ${MEM_PARAM:=mem}
+                memory_request="#PBS -l $MEM_PARAM=${MEMORY}${MEM_UNIT}" 
              fi 
              if [[ -z $PROCS ]]; then
                 #procs_request="#PBS -l procs=$DEFAULT_BATCH_PROCS"
@@ -155,6 +178,16 @@ make_pbs_script () {
              fi
              ;;
    esac
+   
+    mods_request=""
+    #handle the module specifications. - Simon Gladman 2014
+    if [[  ! -z $MODULES ]]; then
+        for MOD in $MODULES
+        do
+            mods_request="${mods_request}
+module load $MOD"
+        done
+    fi
 
    # write out the job script to a file
    cat > $job_script_name << HERE
@@ -166,8 +199,13 @@ $memory_request
 $procs_request
 #PBS -q $QUEUE
 $CUSTOM
+set -e;
+$mods_request
 cd \$PBS_O_WORKDIR
 $COMMAND
+
+$POST_CMD
+
 HERE
 
    echo $job_script_name
@@ -181,9 +219,9 @@ start () {
    if [[ -f $job_script_name ]]
       then
          # launch the job and get its id
-         job_id_full=`qsub $job_script_name`
+         job_id_full=`qsub $CUSTOM_SUBMIT_OPTS $job_script_name`
          qsub_exit_status=$?
-         if [[ $? -eq 0 ]]
+         if [[ $qsub_exit_status -eq 0 ]]
             then
                # bite off the job number from the start of the job identifier
                job_id_number=`echo $job_id_full | sed -n 's/\([0-9][0-9]*\).*/\1/p'`
@@ -206,7 +244,7 @@ stop () {
          # try to stop it
          qdel "$1"
          qdel_success=$?
-         if [[ qdel_success == 0 ]]
+        if [[ $qdel_success == 0 ]]
             then
                exit $SUCCESS
             else

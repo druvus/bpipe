@@ -26,7 +26,9 @@
 package bpipe
 
 import groovy.transform.CompileStatic;
-import groovy.util.logging.Log;
+import groovy.util.logging.Log
+
+import java.util.regex.Pattern
 
 /**
  * Represents a "magic" output object that automatically 
@@ -111,6 +113,8 @@ class PipelineOutput {
      */
     PipelineOutput parentOutput = null
     
+    boolean multiple = false
+    
     /**
      * Create a pipeline output wrapper
      * 
@@ -134,28 +138,54 @@ class PipelineOutput {
     
     String toString() {
         
-        // Value set by parent, and we have not resolved
-        // any different value ourselves
-        if(stringValue != null) {
-            this.outputChangeListener(stringValue, parentOutput?.stringValue)
-            return stringValue
-        }
-        
-        String firstOutput = Utils.first(output)
-        String replaceOutput = null
-        
-        // If $output is referenced without extension, we may have to reset the outputs 
-        // if the output is based on an alternative input to the default one that was set
-        // when the filter() was executed
-        if(this.overrideOutputs && this.currentFilter != null && !(firstOutput in overrideOutputs)) {
-            if(Utils.ext(firstOutput) in currentFilter.exts) {
-                replaceOutput = this.overrideOutputs[0]
+        if(multiple) {
+            this.outputUsed = String.valueOf(Utils.first(output))
+            List boxed = Utils.box(output).unique()
+            for(String o in boxed) {
+                
+            String replaceOutput = null
+            
+            // If $output is referenced without extension, we may have to reset the outputs 
+            // if the output is based on an alternative input to the default one that was set
+            // when the filter() was executed
+            if(this.overrideOutputs && this.currentFilter != null && !(o in overrideOutputs)) {
+                if(Utils.ext(o) in currentFilter.exts) {
+                    replaceOutput = this.overrideOutputs[0]
+                }
             }
+            
+            if(this.outputChangeListener && o != null)
+              this.outputChangeListener(o,replaceOutput)                
+            }
+            
+            return boxed.join(" ")
         }
-        
-        if(this.outputChangeListener)
-          this.outputChangeListener(firstOutput,replaceOutput)
-        return String.valueOf(firstOutput) 
+        else {
+            
+            // Value set by parent, and we have not resolved
+            // any different value ourselves
+            if(stringValue != null) {
+                this.outputChangeListener(stringValue, parentOutput?.stringValue)
+                return stringValue
+            }
+            
+            String firstOutput = Utils.first(output)
+            String replaceOutput = null
+            
+            // If $output is referenced without extension, we may have to reset the outputs 
+            // if the output is based on an alternative input to the default one that was set
+            // when the filter() was executed
+            if(this.overrideOutputs && this.currentFilter != null && !(firstOutput in overrideOutputs)) {
+                if(Utils.ext(firstOutput) in currentFilter.exts) {
+                    replaceOutput = this.overrideOutputs[0]
+                }
+            }
+            
+            if(this.outputChangeListener && firstOutput != null)
+              this.outputChangeListener(firstOutput,replaceOutput)
+              
+            return String.valueOf(firstOutput) 
+        }
     }
    
     /**
@@ -202,7 +232,7 @@ class PipelineOutput {
                     // spurious "output missing" errors or attempts to recreate the output because Bpipe
                     // thinks it should exist when it doesn't
                     // see produce_to_dir_no_output_ref test
-                    if(it != defaultOutput)
+                    if(it != defaultOutput && it != null)
                         this.outputChangeListener(it,null)
                 }
             }
@@ -210,19 +240,19 @@ class PipelineOutput {
         else {
             parentDir = new File(".")
             if(baseOutput) {
-                if(this.outputChangeListener)
+                if(this.outputChangeListener && (baseOutput != defaultOutput))
                     this.outputChangeListener(baseOutput,null)
             }
         }
 
         String result = parentDir.absoluteFile.canonicalPath
         if(Utils.isWindows())
-            result  = result.replaceAll('\\\\', '/')
+            result  = result.replace('\\', '/')
         return result
     }
     
     void setDir(Object value) {
-        if(this.outputDirChangeListener)
+        if(this.outputDirChangeListener && value != null)
             this.outputDirChangeListener(value.toString())
     }
     
@@ -238,7 +268,7 @@ class PipelineOutput {
         // the outputs,  so the output extension acts as a selector from
         // those rather than a synthesis of a new name
         if(this.overrideOutputs) {
-           result = selectFromOverrides(name)  
+           return selectFromOverrides(name)  
         }
         else 
            result = synthesiseFromName(name)
@@ -265,7 +295,9 @@ class PipelineOutput {
         return po
     }
     
-    def selectFromOverrides(String name) {
+    static Pattern FILE_EXT_PATTERN = ~'\\.[^.]*$'
+    
+    PipelineOutput selectFromOverrides(String name) {
         String result = this.overrideOutputs.find { it.toString().endsWith('.' + name) }
         def replaced = null
         if(!result) {
@@ -274,11 +306,10 @@ class PipelineOutput {
                 
                 replaced = this.overrideOutputs[0]
                 
-                // result = this.overrideOutputs[0].replaceAll('\\.[^.]*$',"." + name)
                 String baseInput = this.resolvedInputs.find {it.endsWith(name)}
                 if(!baseInput) {
                     baseInput = this.overrideOutputs[0]
-                    result = baseInput.replaceAll('\\.[^.]*$',"." + name)
+                    result = baseInput.replaceAll(FILE_EXT_PATTERN,"." + name)
                 }
                 else {
                     log.info "Recomputing filter on base input $baseInput to achieve match with output extension $name"
@@ -289,17 +320,31 @@ class PipelineOutput {
             }
         }
         
-        if(!result)
-            throw new PipelineError("An output of type ." + name + " was referenced, however such an output was not in the outputs specified by an outer transform / filter / produce statement.\n\n" + "Valid outputs are: ${overrideOutputs.join('\n')}")
-          else
-            log.info "Selected output $result with extension $name from expected outputs $overrideOutputs"
+       PipelineOutput childOutput = this.createChildOutput(result, name) 
+       
+        if(!result) {
+            String dottedName = '.' + name + '.'
+            
+            List<String> filteredResults = overrideOutputs.grep { it.contains(dottedName) }
+            
+            if(filteredResults.isEmpty()) {
+                throw new PipelineError("An output containing or ending with '." + name + "' was referenced.\n\n"+
+                                        "However such an output was not in the outputs specified by an enclosing transform / filter / produce statement.\n\n" +
+                                        "Valid outputs according to the enclosing block are: ${overrideOutputs.join('\n')}")
+            }
+            else {
+                childOutput.overrideOutputs = filteredResults
+            }
+        }
+        
+        log.info "Selected output $result with extension $name from expected outputs $overrideOutputs"
           
         this.outputUsed = result
-        if(this.outputChangeListener != null) {
+        if(this.outputChangeListener != null && result != null) {
             this.outputChangeListener(result,replaced)
         }
         
-        return result
+        return childOutput
     }
     
     def synthesiseFromName(String name) {
@@ -308,8 +353,13 @@ class PipelineOutput {
         // input then this is more like a filter; remove the previous output extension from the path
         // eg: foo.csv.bar => foo.baz.csv
         List branchSegment = branchName ? ['.' + branchName] : [] 
-        String segments = (branchSegment + [stageName] + extraSegments + [name]).collect { it.replaceAll("^\\.","").replaceAll("\\.\$","") }.join(".")
-        if(stageName.equals(this.output)) {
+        String segments = (branchSegment + [stageName] + extraSegments + [name]).collect { 
+            FastUtils.strip(it,'.')
+         }.join(".")
+         
+        File outputFile = new File(this.output)
+         
+        if(stageName.equals(outputFile.name)) {
            this.outputUsed = FastUtils.dotJoin(([this.defaultOutput] + branchSegment + [name]) as String[])
         }
         else
@@ -330,6 +380,8 @@ class PipelineOutput {
         return this.outputUsed
     }
     
+    private static Pattern DOT_NUMBER_PATTERN = ~'\\.[^\\.]*(\\.[0-9]*){0,1}$'
+    
     /**
      * Compute a name for the output based on the assumption it is 
      * doing something like a 'transform' operation.
@@ -341,7 +393,9 @@ class PipelineOutput {
     String computeOutputUsedAsTransform(String extension, String segments) {
         
         // First remove the stage name, if it is at the end
-        String result = this.defaultOutput.replaceAll('\\.'+stageName+'$', '')
+        String result = this.defaultOutput
+        if(result.endsWith(stageName) && result.endsWith('.'+stageName))
+            result = defaultOutput.substring(0,result.size() - stageName.size()-1)
             
         // If the branch name is now at the end and there is a suffix we can remove the suffix
         // eg: from test.chr1.txt produce test.chr1.hello.csv rather than test.txt.chr1.hello.csv
@@ -356,7 +410,7 @@ class PipelineOutput {
                 // occur when the use uses multiple outputs ($output1.csv, $output2.csv) and 
                 // the same output file is generated for the outputs - such file names get 
                 // a numeric index inserted. eg: test1.txt, test1.txt.2
-                result = result.replaceAll('\\.[^\\.]*(\\.[0-9]*){0,1}$', '$1.'+segments)
+                result = result.replaceAll(DOT_NUMBER_PATTERN, '$1.'+segments)
             else
                 result = result + "." + segments
         }
@@ -380,6 +434,35 @@ class PipelineOutput {
         if(this.outputChangeListener != null) 
             this.outputChangeListener(this.outputUsed,null)
         return PipelineCategory.getPrefix(this.outputUsed);
+    } 
+    
+   /**
+     * Return the outputs with each one prefixed by the specified flag
+     * <p>
+     * If the flag ends with "=" then no space is included between the flag
+     * and the option. Otherwise, a space is included.
+     * 
+     * @param flag name of flag, including dashes (eg: "-I" or "--input")
+     * @return  string containing each matching input prefixed by the flag and a space
+     */
+    public String withFlag(String flag) {
+        
+       this.outputUsed = String.valueOf(Utils.first(output))
+        
+       List boxed = Utils.box(output).unique()
+       if(!multiple)
+           boxed = [boxed[0]]
+       
+       for(String o in boxed) {
+           if(this.outputChangeListener != null) 
+               this.outputChangeListener(o,null)
+       }
+            
+       if(flag.endsWith("=")) {
+           return boxed.collect { "${flag}${it}" }.join(" ") 
+       }
+       else
+           return boxed.collect { "$flag $it" }.join(" ")
     } 
     
 }

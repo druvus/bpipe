@@ -25,10 +25,11 @@
 package bpipe
 
 import groovy.util.logging.Log;
-import bpipe.executor.CommandExecutor;
+import bpipe.executor.CommandExecutor
+import bpipe.executor.ProbeCommandExecutor;;
 
 @Log
-class Command implements Serializable {
+class Command implements Serializable { 
     
     public static final long serialVersionUID = 0L
     
@@ -37,6 +38,13 @@ class Command implements Serializable {
      * create unique files as it is guaranteed to be unique to this command
      */
     String id
+    
+    /**
+     * The id of the stage that executed the command.
+     * 
+     * @see bpipe.PipelineStage#stageId
+     */
+    String stageId
     
     /**
      * Human readable short name for the command. Usually this is set to just
@@ -83,17 +91,27 @@ class Command implements Serializable {
     CommandStatus status
     
     /**
+     * The exit code of the command IF it has exited
+     */
+    int exitCode = -1
+    
+    /**
+     * Whether the command has had resources allocated
+     */
+    boolean allocated = false
+    
+    /**
      * Internal configuration = accessed via getConfig()
      */
     private Map cfg
     
-    Map getConfig(inputs) {
+    Map getConfig(List inputs) {
         if(cfg != null)
             return cfg
             
         // How to run the job?  look in user config
         if(!configName)
-            configName = command.trim().split(/\s/)[0].trim()
+            configName = command.trim().tokenize(' \t')[0].trim()
         
         log.info "Checking for configuration for command $configName"
         
@@ -114,7 +132,7 @@ class Command implements Serializable {
         this.cfg = rawCfg.clone()
         
         // Resolve inputs to files
-        List fileInputs = inputs.collect { new File(it) }
+        List fileInputs = inputs == null ? [] : inputs.collect { new File(it) }
         
         // Execute any executable properties that are closures
         rawCfg.each { key, value ->
@@ -128,7 +146,22 @@ class Command implements Serializable {
                 log.info "Converted walltime is " + cfg[key]
             }
         }
+        
+        // Ensure configuration knows its own name
+        cfg.name = configName
+        
         return cfg
+    }
+    
+    /**
+     * Return an already initialised configuration. Note that this means
+     * getConfig() must have been called at least once with a list of inputs!
+     * 
+     * @return  processed configuration, converted to Map
+     */
+    Map getProcessedConfig() {
+        assert this.cfg != null
+        return this.cfg
     }
     
     private String formatWalltime(def walltime) {
@@ -148,8 +181,10 @@ class Command implements Serializable {
         try {
             CommandStatus statusEnum = CommandStatus.valueOf(statusValue)
             if(statusEnum != this.status) {
-                if(statusEnum == CommandStatus.RUNNING)
+                if((statusEnum == CommandStatus.RUNNING) ||
+                   ((this.status == CommandStatus.WAITING) && (statusEnum==CommandStatus.COMPLETE))) {
                     this.startTimeMs = System.currentTimeMillis()
+                }
             }
             this.status = statusEnum
                 
@@ -157,5 +192,62 @@ class Command implements Serializable {
         catch(Exception e) {
             log.warning("Failed to update status for result $statusValue: $e")
         }
+    }
+    
+    File dir
+
+    synchronized void save() {
+        
+       def e = this.executor
+       if(e instanceof bpipe.executor.ThrottledDelegatingCommandExecutor)
+            e = e.commandExecutor
+  
+       if(!dir.exists())
+           dir.mkdirs()
+           
+       // Temporarily swap out the config if necessary
+       def tempCfg = cfg
+       if(cfg instanceof ConfigObject) {
+           cfg = cfg.collectEntries { it }
+       }
+           
+       File saveFile = new File(dir, this.id)
+       Command me = this
+       
+       saveFile.withObjectOutputStream { ois ->
+           ois.writeObject(e)
+           ois.writeObject(me)
+       } 
+       
+       cfg = tempCfg
+    }
+    
+    static Command load(File f) {
+        Command cmd
+        f.withObjectInputStream {
+            CommandExecutor exec = it.readObject()
+            cmd = it.readObject()
+        }
+        return cmd
+    }
+
+    boolean isResourcesSatisfied() {
+        return this.allocated || (this.executor != null && this.executor instanceof ProbeCommandExecutor)
+    }
+    
+   transient Closure commandListener
+    
+    void setCommand(String cmd) {
+        this.command = cmd
+        if(commandListener != null)
+            commandListener(this)
+    }
+    
+    static Command readCommand(File saveFile) {
+        saveFile.withObjectInputStream { ois ->
+            CommandExecutor exe2 = ois.readObject()
+            Command c2 = ois.readObject()
+            return c2
+        }       
     }
 }

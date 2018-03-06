@@ -31,44 +31,19 @@ import java.util.concurrent.TimeUnit;
 
 import bpipe.Config;
 import bpipe.EventManager;
+import bpipe.NodeListCategory;
+import bpipe.Pipeline;
 import bpipe.PipelineContext;
 import bpipe.PipelineEvent;
 import bpipe.PipelineEventListener;
 import bpipe.PipelineStage;
-
+import bpipe.Runner
+import bpipe.cmd.Stop;
 import groovy.json.JsonOutput;
+import groovy.json.JsonSlurper
 import groovy.util.logging.Log;
-
 import static PipelineEvent.*
 
-/**
- * Convenience wrapper that gives a few useful additional methods for
- * sending HTTP protocol constructs.
- * 
- * @author Simon
- */
-class HttpWriter {
-    @Delegate
-    Writer wrapped
-    
-    /**
-     * Sends the output termintaed by an appropriate newline
-     */
-    HttpWriter headerLine(String line) {
-      wrapped.print(line + "\r\n")
-      return this
-    }
-    
-    /**
-     * Necessary because default print method comes from Object
-     * and prints to stdout.
-     * 
-     * @param obj
-     */
-    void print(Object obj) {
-        this.wrapped.print(obj)
-    }
-}
 
 /**
  * Event listener that forwards pipeline events to a remote
@@ -85,20 +60,9 @@ class WorxEventListener implements PipelineEventListener {
     ExecutorService service 
     
     /**
-     * Underlying socket for connection to Worx server.
-     * This is wrapped by #socketReader and #socketWriter.
+     * Low level connection to worx server
      */
-    Socket socket 
-    
-    /**
-     * Reader for reading the socket
-     */
-    Reader socketReader
-    
-    /**
-     * Writer for writing to socket
-     */
-    HttpWriter socketWriter
+    HttpWorxConnection worx
     
     @Log
     class WorxEventJob implements Runnable {
@@ -115,107 +79,76 @@ class WorxEventListener implements PipelineEventListener {
             "${event.name()} : " + properties
         }
     }
-   
-    void sendEventJson(eventJson) {
-        socketWriter.headerLine("POST /events HTTP/1.1")
-                    .headerLine("Content-Type: application/json")
-                    .headerLine("Content-Length: " + eventJson.size())
-                    .headerLine("")
-                    .flush()
-        
-        socketWriter.print(eventJson+"\r\n")
-        socketWriter.headerLine("")
-                    .flush()
-    }
-    
-    /**
-     * Read the HTTP response from the given reader.
-     * First reads headers and observes content length header to 
-     * then load the body. Requires content length to be set!
-     * 
-     * @param reader
-     * @return
-     */
-    String readResponse(reader) {
-        
-        // Read headers
-        String line
-        int blankCount=0
-        Map headers = [:]
-        while(true) {
-          line = reader.readLine()
-          if(!line && (++blankCount>0)) {
-              break
-          }
-          if(line)
-            blankCount = 0
-          def header = line.trim().split(':')
-          if(header.size()>1)
-            headers[header[0]] = header[1]
-        }
-
-        log.info "Content Length = " + headers['Content-Length'].toInteger()
-        char [] buffer = new char[headers['Content-Length'].toInteger()+1]
-        reader.read(buffer)
-
-//        println "REPONSE: \n" + buffer
-        
-        return new String(buffer)
-    }
 
     void sendEvent(WorxEventJob job) {
                    
         try {
-            if(socket == null || !socket.isClosed())
-                resetSocket()
-            
             log.info "Sending event " + job.toString()
             
-            Map eventDetails = job.properties.clone()
-                                  .collect {(it.value instanceof PipelineStage) ? it.value.toProperties() : it}
-                                  .collectEntries()
+            Map eventDetails = bpipe.Utils.sanitizeForSerialization(job.properties)
                     
-            eventDetails.time = System.currentTimeMillis()
+            eventDetails.time = System.currentTimeMillis() 
             eventDetails.event = job.event.name()
             eventDetails += [
                 pid: Config.config.pid,
-                script: Config.config.script
+                script: eventDetails.script ?: Config.config.script,
+                pguid: eventDetails.pguid ?: Config.config.pguid
             ]
-            sendEventJson(JsonOutput.toJson([events: [eventDetails]]))
             
-            def response = readResponse(socketReader)
+            /*
+            println "EVENT DETAILS: "
+            eventDetails.each { e ->
+                println e.key + " : " + e.value
+            }
+            */
+            
+            eventDetails.commands = null
+            
+            try {
+                String json = JsonOutput.toJson([events: [eventDetails]])
+                log.info "Send: $json"
+                worx.sendJson("/events", json)
+                log.info "Sent json OK"
+            }
+            catch(Throwable e) {
+                e.printStackTrace()
+            }
+            
+            log.info "Read response ..."
+            def response = worx.readResponse()
             log.info "Response: $response"
+            
+            if(response == null)
+                return;
+            
+            for(Map cmd in response.commands) {
+                if(cmd.command == "stop") {
+                    new Stop().run(System.out, cmd.arguments)
+                }
+            }
         }
         catch(Exception e) {
-            log.severe "Failed to send event $this"
+            log.info "Error sending event ($e)"
+            log.severe "Failed to send event to remote worx host: $e"
             e.printStackTrace()
         }
-      
-    }
-    
-    void resetSocket() {
-        
-        log.info "Resetting Worx connection ..."
-        try {
-            socket.close()
-        }
-        catch(Exception e) {
-            // Ignore
-        }
-        
-        String configUrl = Config.userConfig["worx.url"]?:"http://127.0.0.1:8888/"
-        URL url = new URL(configUrl)
-        socket = new Socket(url.host, url.port) 
-        
-        socketReader = new BufferedReader(new InputStreamReader(socket.inputStream))
-        socketWriter = new HttpWriter(wrapped: new PrintWriter(socket.outputStream))
     }
     
     void start() {
+        
+        this.worx = new HttpWorxConnection()
+        
         [
              PipelineEvent.STARTED,
              PipelineEvent.STAGE_STARTED,
+             PipelineEvent.STAGE_FAILED, 
              PipelineEvent.STAGE_COMPLETED, 
+             PipelineEvent.SEND, 
+             PipelineEvent.CHECK_EXECUTED, 
+             PipelineEvent.CHECK_SUCCEEDED, 
+             PipelineEvent.CHECK_FAILED, 
+             PipelineEvent.CHECK_OVERRIDDEN, 
+             PipelineEvent.FINISHED,
              PipelineEvent.SHUTDOWN
         ].each { EventManager.instance.addListener(it,this) } 
         
@@ -241,14 +174,40 @@ class WorxEventListener implements PipelineEventListener {
         if(!ctx)
             ctx = details.ctx
        
-        if(eventType == STARTED) {
-            if(details.pipeline) {
-                details.pipeline = groovy.json.JsonOutput.toJson(details.pipeline)
+        if(Config.config.script) {
+            File scriptFile = new File(Config.config.script)
+            if(eventType == STARTED || eventType == FINISHED) {
+                if(details.pipeline && eventType == STARTED) {
+                    use(NodeListCategory) {
+                        details.pipeline = groovy.json.JsonOutput.toJson(Pipeline.getNodeGraph(details.pipeline))
+                        log.info "Sending pipeline structure: $details.pipeline"
+                    } 
+                }
+                else {
+                    details.remove("pipeline")
+                }
+                
+                details.title = Pipeline.documentation.title
+                details.name = Pipeline.documentation.name
+                details.documentation = Pipeline.documentation
+                if(!details.title) {
+                    if(details.name) {
+                        details.title = details.name
+                    }
+                    else
+                        details.title = scriptFile.name.replaceAll('\\.[^\\.]*?$', '').capitalize()
+                }
+                details.dir = Runner.runDirectory
             }
+            
+            // All events tied to a script
+            details.script = scriptFile.canonicalPath
         }
         
-        WorxEventJob job = new WorxEventJob(event:eventType, properties: [desc: desc] + details)
-        
+        // All events
+        details.host = InetAddress.getLocalHost().hostName
+            
+        WorxEventJob job = new WorxEventJob(event:eventType, properties: [desc: desc, timeMs: System.currentTimeMillis()] + details)
         this.service.submit(job);
         
         /*

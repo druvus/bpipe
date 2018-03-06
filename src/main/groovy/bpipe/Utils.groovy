@@ -30,18 +30,27 @@ import groovy.util.logging.Log;
 import groovy.xml.XmlUtil;
 
 import java.lang.management.ManagementFactory;
-import java.lang.management.OperatingSystemMXBean;
+import java.lang.management.OperatingSystemMXBean
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.DigestInputStream
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
+import java.util.logging.ConsoleHandler;
+import java.util.logging.FileHandler
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.regex.Pattern
+import org.codehaus.groovy.runtime.StackTraceUtils
 
 /**
  * Miscellaneous internal utilities used by Bpipe
  * 
  * @author ssadedin@mcri.edu.au
  */
-@Log
 class Utils {
+    
+    public static Logger log = Logger.getLogger("bpipe.Utils")
     
     /**
      * Returns a list of output files that appear to be out of date
@@ -67,13 +76,24 @@ class Utils {
         outputs = box(outputs)
         
         def inputFiles = inputs.collect { new File(it) }
-    
+        
+        def inputFileTimestamps = inputFiles.collectEntries { [ it, it.lastModified() ] }
+       
+        long maxInputTimestamp = (inputFileTimestamps.max { it.value }?.value)?:0
+        
         outputs.collect { new File(it) }.grep { outFile ->
+            
+            long outputTimestamp = outFile.lastModified()
             
             log.info "===== Check $outFile ====="
             if(!outFile.exists()) {
                 log.info "file doesn't exist: $outFile"
                 return true
+            }
+            
+            if(maxInputTimestamp < outputTimestamp) {
+                log.info "Output newer than all inputs (quick check: $maxInputTimestamp vs $outputTimestamp)"
+                return false
             }
                 
             if(inputs instanceof String || inputs instanceof GString) {
@@ -87,10 +107,19 @@ class Utils {
             }
             else
             if(isContainer(inputs)) {
-                log.info "Checking $outFile against inputs $inputs"
-                return inputFiles.any { inFile ->
-                    log.info "Check $inFile : " + inFile.lastModified() + " >  " + "$outFile : " + outFile.lastModified() 
-                    inFile.lastModified() > outFile.lastModified() 
+                
+                if(inputs.size()<20)
+                    log.info "Checking $outFile against inputs $inputs"
+                else
+                    log.info "Checking $outFile against ${inputs.size()} inputs"
+                    
+                boolean logTimestamps = inputFiles.size()*outputs.size() < 5000 // 5k lines in the log from 1 loop is too much
+                
+                return inputFiles.any { File inFile ->
+                    long inputFileTimestamp = inputFileTimestamps[inFile]
+                    if(logTimestamps) 
+                        log.info "Check $inFile : " + inputFileTimestamp + " >  " + "$outFile : " + outputTimestamp
+                    inputFileTimestamp > outputTimestamp
                 }
             }
             else 
@@ -98,6 +127,20 @@ class Utils {
                 
             return true    
         }
+    }
+    
+    static boolean fileExists(File f) {
+        
+       if(f.exists())
+           return true
+           
+       if(!f.exists()) {
+           log.info "File $f does not appear to exist: listing directory to flush file system"
+           try { f.absoluteFile.parentFile.listFiles() } catch(Exception e) { log.warning("Failed to list files of parent directory of $f"); }
+           if(f.exists())
+               log.info("File $f revealed by listing directory")
+       } 
+       return f.exists()
     }
     
     /**
@@ -112,34 +155,40 @@ class Utils {
             return
             
         List<String> failed = []
-        box(outputs).collect { new File(it) }.each { File f -> if(f.exists()) {  
-            // it.delete() 
-            File trashDir = new File(".bpipe/trash")
-            if(!trashDir.exists())
-                trashDir.mkdirs()
-                
-            File dest = new File(trashDir, f.name)
-            if(!Runner.opts.t) {
-                int count = 1;
-                while(dest.exists()) {
-                    dest = new File(trashDir, f.name + ".$count")
-                    ++count
+        box(outputs).collect { new File(it) }.each { File f -> 
+            
+            if(fileExists(f)) {  
+                // it.delete() 
+                File trashDir = new File(".bpipe/trash")
+                if(!trashDir.exists())
+                    trashDir.mkdirs()
+                    
+                File dest = new File(trashDir, f.name)
+                if(!Runner.opts.t) {
+                    int count = 1;
+                    while(dest.exists()) {
+                        dest = new File(trashDir, f.name + ".$count")
+                        ++count
+                    }
+                    
+                    if(!f.renameTo(dest) && f.exists()) {
+                        println "WARNING: failed to clean up file $f"
+                        log.severe("Unable to cleanup file ${f.absolutePath} by moving it to ${dest.absolutePath}. Creating dirty file record.")
+                        failed.add(f.canonicalFile.absolutePath)
+                    }
+                    else {
+                        println "Cleaned up file $f to $dest" 
+                        log.info("Cleaned up file ${f.absolutePath} by moving it to ${dest.absolutePath}")
+                    }
+                    
                 }
-                
-                if(!f.renameTo(dest) && f.exists()) {
-                    println "WARNING: failed to clean up file $f"
-                    log.severe("Unable to cleanup file ${f.absolutePath} by moving it to ${dest.absolutePath}. Creating dirty file record.")
-                    failed.add(f.canonicalFile.absolutePath)
-                }
-                else {
-                    println "Cleaned up file $f to $dest" 
-                    log.info("Cleaned up file ${f.absolutePath} by moving it to ${dest.absolutePath}")
-                }
-                
+                else
+                    println "[TEST MODE] Would clean up file $f to $dest" 
             }
-            else
-                println "[TEST MODE] Would clean up file $f to $dest" 
-        }}
+            else {
+                log.info "Not cleaning up file $f because it does not exist"
+            }
+        }
         return failed
     }
     
@@ -155,13 +204,14 @@ class Utils {
      * Normalize a single input and array into a collection, 
      * return existing collections as is
      */
+    @CompileStatic
     static Collection box(outputs) {
         
         if(outputs == null)
             return []
         
         if(outputs instanceof Collection)
-            return outputs
+            return (Collection)outputs
         
         if(outputs.class.isArray())    
             return outputs as List
@@ -687,11 +737,312 @@ class Utils {
      *                  sequential recurrent values reduced to single instance
      */
     static List removeRuns(List<String> values) {
+        removeRuns(values,values)
+    }
+    
+    static List removeRuns(List<Object> target, List<String> values) {
         def last = new Object()
-        values.grep {
+        target[values.findIndexValues {
           def result = (last == null) || (last != it)
           last = it
           return result
+        }]
+    }
+    
+    static HashMap<String,File> canonicalFiles = new ConcurrentHashMap<String, File>(1000)
+    
+    static File canonicalFileFor(String path) {
+        File result = canonicalFiles[path]
+        if(result != null)
+            return result 
+            
+        result = new File(path).canonicalFile
+        canonicalFiles[path] = result
+        
+        if(canonicalFiles.size() % 1000 == 0)
+            log.info "Number of cached canonical paths = " + canonicalFiles.size()
+            
+        return result
+    }
+    
+    /**
+     * Set up simple logging to work in a sane way
+     * 
+     * @param path
+     * @return
+     */
+    public static configureSimpleLogging(String path) {
+        def parentLog = Logger.getLogger("bpipe.Runner").parent
+        parentLog.getHandlers().each { parentLog.removeHandler(it) }
+        FileHandler fh = new FileHandler(path)
+        fh.setFormatter(new BpipeLogFormatter())
+        parentLog.addHandler(fh)
+    }
+    
+   public static void configureVerboseLogging() {
+        ConsoleHandler console = new ConsoleHandler()
+        console.setFormatter(new BpipeLogFormatter())
+        console.setLevel(Level.FINE)
+        log.getParent().addHandler(console)
+    }
+   
+   public static resolveRscriptExe() {
+       resolveExe("R", "Rscript")
+   }
+   
+   public static resolveExe(String name, String defaultExe) {
+       String resolvedExe = defaultExe
+       if(Config.userConfig.containsKey(name) && Config.userConfig[name].containsKey("executable")) {
+           resolvedExe = Config.userConfig[name].executable
+           File exeFile = new File(resolvedExe)
+           if(!exeFile.exists()) {
+               Path scriptParentDir = new File(Config.config.script).absoluteFile.parentFile.toPath()
+               Path relativeToPipeline = scriptParentDir.resolve(exeFile.toPath())
+               if(Files.exists(relativeToPipeline)) {
+                   String pathRelativeToPipeline = relativeToPipeline.toFile().absolutePath
+                   log.info "Interpreting tool path $resolvedExe as relative to pipeline: $pathRelativeToPipeline"
+                   resolvedExe = pathRelativeToPipeline
+               }
+           }
+           log.info "Using custom $name executable: $resolvedExe"
+       }
+       return resolvedExe
+   }
+   
+   static Pattern GROOVY_EXT = ~'\\.groovy$'
+   
+   /**
+    * Compute a nicely formatted stack trace, with groovy generated script names 
+    * replaced with corresponding bpipe script names 
+    * 
+    * @param t  Exception to format
+    * @return   String value of stack trace, nicely formatted
+    */
+    @CompileStatic
+    private static String prettyStackTrace(Throwable t) {
+        
+        Throwable sanitized = StackTraceUtils.deepSanitize(t)
+        StringWriter sw = new StringWriter()
+        sanitized.printStackTrace(new PrintWriter(sw))
+        String stackTrace = sw.toString()
+        Pipeline.scriptNames.each { fileName, internalName -> 
+            stackTrace = stackTrace.replaceAll(internalName, fileName.replaceAll(GROOVY_EXT,'')) 
+        }
+        return stackTrace
+    }
+    
+    /**
+     * Execute the given command and return back a map with the exit code,
+     * the standard output, and std err 
+     * <p>
+     * An optional closure will be executed as a delegate of the ProcessBuilder created
+     * to allow configuration.
+     * 
+     * @param startCmd  List of objects (will be converted to strings) as args to command
+     * @return Map with exitValue, err and out keys
+     */
+    static Map<String,Object> executeCommand(Map options = [:], List<Object> startCmd, Closure builder = null) {
+        
+        List<String> stringified = startCmd*.toString()
+        
+        log.info "Executing command: " + stringified.join(' ')
+        
+        ProcessBuilder pb = new ProcessBuilder(stringified)
+        if(builder != null) {
+            builder.delegate = pb
+            builder()
+        }
+        
+        Process p = pb.start()
+        Map result = [:]
+        Utils.withStreams(p) {
+            Appendable out = options.out ?: new StringBuilder()
+            Appendable err = options.err ?: new StringBuilder()
+            
+            // Note: observed issue with hang here on Broad cluster
+            // seems to be related to hang inside OS / NFS call. Maybe use forwarder for this?
+            p.waitForProcessOutput(out, err)
+            
+            result.exitValue = p.waitFor()
+            result.err = err
+            result.out = out
+        }        
+        return result
+    }
+    
+    static boolean isProcessRunning(String pid) {
+        String info = "ps -o ppid,ruser -p ${pid}".execute().text
+        def lines = info.split("\n")*.trim()
+        if(lines.size()>1)  {
+            info = lines[1].split(" ")[1]; 
+            if(info == System.properties["user.name"]) {
+                return true
+            }
+        }        
+        return false
+    }
+    
+    static String formatErrors(Collection<PipelineError> errors) {
+        
+        int width = Config.config.columns
+        
+        return errors.collect {  PipelineError e ->
+            String branch = e.ctx?.branch?.name
+            if(branch != null && branch != "all") {
+                branch = " ( $branch ) "
+            }
+            
+            (e.ctx ? " $e.ctx.stageName $branch " : "").center(width,"-") + "\n\n" + e.message + "\n"
+        }.join("\n") + "\n" + ("-" * width)
+        
+        
+    }
+    
+    
+    final static long SECOND=1000L
+    final static long MINUTE= 60 * SECOND
+    final static long HOUR=60 * MINUTE
+    final static long DAY=24*HOUR
+    
+    /**
+     * Convert a time specified in a configuration to ms
+     * 
+     * @return
+     */
+    static long walltimeToMs(Object timeSpec) {
+        
+        String stringValue = String.valueOf(timeSpec)
+        
+        // If integer, then assume it is seconds
+        if(stringValue.isInteger()) {
+            return ((long)stringValue.toInteger()) * 1000L
+        }
+        
+        // If not integer, parse in format DD:HH:MM
+        List<String> parts = stringValue.tokenize(":")*.toInteger().reverse()
+        return [[SECOND, MINUTE, HOUR, DAY], parts].transpose().sum { unitAndValue ->
+            unitAndValue[0]*unitAndValue[1]
+        }
+    }
+    
+    static Pattern TRIM_SECONDS = ~',[^,]*?seconds$'
+    
+    static Pattern TRIM_ZEROS = ~'\\.000 seconds$'
+    
+    static String table(Map options = [:], List<String> headers, List<List> rows) {
+        
+        String indent = options.indent ? (" " * options.indent) : ""
+        
+        def out = options.out ?: System.out
+        
+        // Create formatters
+        Map formatters = options.get('format',[:])
+        headers.each { h ->
+            if(!formatters[h])
+                formatters[h] = { String.valueOf(it) }
+            else 
+            if(formatters[h] instanceof Closure) {
+                // just let it be - it will be called and expected to return the value
+            }
+            else { // Assume it is a String.format specifier (sprintf style)
+                String spec = formatters[h]
+                if(spec == "timespan") {
+                    formatters[h] = { times ->
+                        TimeCategory.minus(times[1],times[0]).toString().replaceAll(TRIM_SECONDS, '').replaceAll(TRIM_ZEROS,' seconds')
+                    }
+                }
+                else {
+                    formatters[h] = { val ->
+                        String.format(spec, val)
+                    }
+                }
+            }
+        }
+        
+        // Create renderers
+        Map renderers = options.get('render',[:])
+        headers.each { hd ->
+            if(!renderers[hd]) {
+                renderers[hd]  = { val, width  -> out.print val.padRight(width) }
+            }
+        }
+        
+        // Find the width of each column
+        Map<String,Integer> columnWidths = [:]
+        if(rows) {
+            headers.eachWithIndex { hd, i ->
+                Object widestRow = rows.max { row -> formatters[hd](row[i]).size() }
+                columnWidths[hd] = Math.max(hd.size(), formatters[hd](widestRow[i]).size())
+            }
+        }
+        else {
+            headers.each { columnWidths[it] = it.size() }
+        }
+            
+        // Now render the table
+        String header = headers.collect { hd -> hd.center(columnWidths[hd]) }.join(" | ")
+        
+        if(options.topborder) {
+            out.println indent + ("-" * header.size())
+        }
+        
+        out.println indent + header
+        out.println indent + ("-" * header.size())
+        
+        rows.each { row ->
+            int i=0
+            headers.each { hd -> 
+                if(i!=0)
+                    out.print(" | ");
+                else
+                    out.print(indent)
+                    
+                 renderers[hd](formatters[hd](row[i++]), columnWidths[hd])
+            }
+            out.println ""
+        }
+    }
+    
+    /**
+     * Wait until action returns a non-null result, with a timeout
+     * returns an object with ok and timeout methods that accept closure
+     * arguments for actions to take.
+     * 
+     * @param timeoutMs
+     * @param action
+     * @return
+     */
+    static Map waitWithTimeout(long timeoutMs, Closure action) {
+        return [
+            ok: { okAction ->
+                long startMs = System.currentTimeMillis()
+                while(true) {
+                    def result = action()
+                    if(result != null)
+                        return [ timeout: { return okAction(result) }]
+                    Thread.sleep(100)
+                    
+                    if(System.currentTimeMillis() - startMs > timeoutMs)
+                        return [ timeout: {  it() }]
+                }
+            }
+        ]
+    }
+    
+    static Map sanitizeForSerialization(Object obj) {
+       obj.clone()
+          .collect {(it.value instanceof PipelineStage) ? ["stage",it.value.toProperties()] : it}
+          .collectEntries() 
+    }
+    
+    static closeQuietly(obj) {
+        if(obj == null)
+            return
+        try {
+            obj.close()
+        }
+        catch(Exception e) {
+            // ignore   
         }
     }
 }

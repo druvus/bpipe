@@ -53,6 +53,11 @@ class CommandManager {
     public static final String DEFAULT_EXECUTED_DIR = ".bpipe/executed"
     
     /**
+     * File where half processed files will be listed on shutdown
+     */
+    public static File UNCLEAN_FILE_PATH = new File(".bpipe/inprogress")
+    
+    /**
      * The location under which running command information will be stored
      */
     File commandDir
@@ -61,6 +66,16 @@ class CommandManager {
      * The location under which completed command information will be stored
      */
     File completedDir
+    
+    /**
+     * Factory used to create executors
+     */
+    ExecutorFactory executorFactory = ExecutorFactory.instance
+    
+    /**
+     * A global list of commands executed by all command managers in this run
+     */
+    static List<Command> executedCommands = Collections.synchronizedList([])
 	
 	/**
 	 * Track the ids of commands that were launched by this command manager
@@ -88,104 +103,88 @@ class CommandManager {
      *                  on the resulting command executor
      * @return the {@link CommandExecutor} that is executing the job.
      */
-    CommandExecutor start(String name, Command command, String configName, Collection inputs, File outputDirectory, Map resources, boolean deferred, Appendable outputLog) {
+    Command start(String name, Command command, String configName, Collection inputs, Map resources, boolean deferred, Appendable outputLog) {
         
         String cmd = command.command
         Map cfg = command.getConfig(inputs)
+        
+        // Create a command id for the job
+        command.id = CommandId.newId()
         
         // Record this as the time the command is "created" (which is
         // really relevant to queuing systems - we wish to be able to see
         // later how much time the command waited in the queue)
         command.createTimeMs = System.currentTimeMillis()
 
-        String executor = cfg.executor
-        
         log.info "Using config $cfg for command"
         
-        // Try and resolve the executor several ways
-        // It can be a file on the file system,
-        // or it can map to a class
-        CommandExecutor cmdExec = null
-        File executorFile = new File(executor)
-        String name1 = "bpipe.executor."+executor.capitalize()
-        if(executorFile.exists()) {
-            cmdExec = new CustomCommandExecutor(executorFile)
-        }
-        else {
-            /* find out the command executor class */
-            Class cmdClazz = null
-            try {
-                cmdClazz = Class.forName(name1)
-            }
-            catch(ClassNotFoundException e) {
-                String name2 = "bpipe.executor."+executor.capitalize() + "CommandExecutor"
-                try {
-                    cmdClazz = Class.forName(name2)
-                }
-                catch(ClassNotFoundException e2) {
-                    log.info("Unable to create command executor using class $name2 : $e2")
-                    String name3 = executor
-                    try {
-                        cmdClazz = Class.forName(name3)
-                    }
-                    catch(ClassNotFoundException e3) {
-                        throw new PipelineError("Could not resolve specified command executor ${executor} as a valid file path or a class named any of $name1, $name2, $name3")
-                    }
-                }
-            }
+        OutputLog commandLog = new OutputLog(outputLog, command.id)
 
-            /* let's instantiate the found command executor class */
-            try {
-                cmdExec = cmdClazz.newInstance()
-            }
-            catch( PipelineError e ) {
-                // just re-trow
-                throw e
-            }
-            catch( Exception e ) {
-                throw new PipelineError( "Cannot instantiate command executor: ${executor}", e )
-            }
-        }
-
+        command.dir = this.commandDir
         
-        if(Runner.opts.t || Config.config.breakTriggered) {
-            if(cmdExec instanceof LocalCommandExecutor)
-              throw new PipelineTestAbort("Would execute: $cmd")
-          else {
-              if(cfg && command.configName) {
-                  cfg.name = configName
-              }
-              throw new PipelineTestAbort("Would execute: $cmd\n\n                using $cmdExec with config $cfg")
-          }
+        // Note: the command returned back may be a new command object,
+        // it is important that we replace the original with it and return
+        // the new one back to the caller.
+        command = createExecutor(command, cfg, outputLog)
+        
+        CommandExecutor cmdExec = command.executor
+        if(Runner.isPaused()) {
+            throw new PipelinePausedException()
         }
         
-        // Create a command id for the job
-        command.id = CommandId.newId()
+        if(!(cmdExec instanceof LocalCommandExecutor)) {
+            if(cfg && command.configName) {
+                cfg.name = configName
+            }
+        }
         
         log.info "Created bpipe command id " + command.id
         
-        // Temporary hack until we figure out design for how output log gets passed through
-        OutputLog commandLog = new OutputLog(outputLog, command.id)
-        if(cmdExec instanceof LocalCommandExecutor) {
-        	cmdExec.outputLog = commandLog
-        	cmdExec.errorLog = commandLog
-        }
-
         ThrottledDelegatingCommandExecutor wrapped = new ThrottledDelegatingCommandExecutor(cmdExec, resources)
         if(deferred)
             wrapped.deferred = true
         
         command.name = name
-        wrapped.start(cfg, command, outputDirectory)
+        command.executor = wrapped
+        wrapped.start(cfg, command, commandLog, commandLog)
     		
 		this.commandIds[cmdExec] = command.id
 		this.commandIds[wrapped] = command.id
-            
-        new File(commandDir, command.id).withObjectOutputStream { it << cmdExec }
+        this.executedCommands << command
         
-        return wrapped
+        command.save()
+        
+        return command
     }
     
+    /**
+     * Attempt to create and assign an executor to the given command.
+     * <p>
+     * First, the pool of pre-allocated executors will be checked for
+     * a compatible executor. If no compatible executor is available in 
+     * the pre-allocated pool, a new executor will be created using the
+     * executorFactory.
+     * 
+     * @param cmd   Command to execute
+     * @param cfg   Configuration of command
+     * 
+     * @return  A Command object (which may be different to the original 
+     *          command object supplied) which has an executor 
+     *          assigned
+     */
+    Command createExecutor(Command cmd, Map cfg, OutputLog outputLog) {
+        
+        cmd = ExecutorPool.requestExecutor(cmd, cfg, outputLog)
+        if(cmd.executor) {
+            log.info "Using pre-allocated executor of type ${cmd.executor.class.name}"
+            return cmd
+        }
+
+        CommandExecutor cmdExec = executorFactory.createExecutor(cfg)
+        cmd.executor = cmdExec
+        return cmd
+    }
+   
     /**
      * Stop all known commands.
      * <p>
@@ -194,25 +193,63 @@ class CommandManager {
      */
     int stopAll() { 
         int count = 0
+        List<Command> stoppedCommands = []
         commandDir.eachFileMatch(~/[0-9]+/) { File f ->
             log.info "Loading command info from $f.absolutePath"
-            CommandExecutor cmd
-            log.info "Stopping command $cmd"
+            CommandExecutor exec
+            Command cmd
             try {
-                f.withObjectInputStream { cmd = it.readObject() }
-                cmd.stop() 
-                cleanup(f.name)
-                log.info "Successfully stopped command $cmd"
+                f.withObjectInputStream { 
+                    exec = it.readObject() 
+                    log.info "Stopping command $exec"
+                    try {
+                        cmd = it.readObject()
+                    }
+                    catch(Exception e) {
+                        log.info "Unable to read command details for $f.absolutePath : maybe legacy pipeline directory?"
+                    }
+                }
+                
+                if(exec != null) {
+                    if(exec instanceof PooledExecutor && exec.poolConfig.get('persistent',false)) {
+                        println "Command $cmd.id is persistent command: ignoring"
+                    }
+                    else {
+                        exec.stop() 
+                        if(cmd)
+                            stoppedCommands << cmd
+                        println "Successfully stopped command $cmd.id ($exec)"
+                    }
+                }
+                else {
+                    println "WARNING: stored command $f.absolutePath had null executor (internal error)"
+                }
             }
             catch(PipelineError e) {
-              System.err.println("Failed to stop command: $cmd.\n\n${Utils.indent(e.message)}\n\nThe job may already be stopped; use 'bpipe cleancommands' to clear old commands.")      
+              System.err.println("WARNING: $cmd.id\n\n${Utils.indent(e.message)}\n\nNote: this may occur if the job is already stopped; use 'bpipe cleancommands' to clear old commands.")      
             }
             catch(Throwable t) {
-              System.err.println("An unexpected error occured while stopping command: $cmd.\n\n${Utils.indent(t.message)}\n\nThe job may already be stopped; use 'bpipe cleancommands' to clear old commands.")      
+              System.err.println("An unexpected error occured while stopping command: $exec.\n\n${Utils.indent(t.message)}\n\nThe job may already be stopped; use 'bpipe cleancommands' to clear old commands.")      
             }            
+            try {
+                cleanup(f.name)
+            }
+            catch(Exception e) {
+                log.error "Failed to clean up command object $f.name: " + e
+            }
             ++count
         }
         log.info "Successfully stopped $count commands"
+        
+        for(Command cmd in stoppedCommands) {
+            try {
+                Utils.cleanup(cmd.outputs)
+            }
+            catch(Exception e) {
+                log.info "Failed to cleanup one or more commands from $cmd.outputs: " + e.toString()
+            }
+        }
+        
         return count
     }
     
@@ -226,9 +263,14 @@ class CommandManager {
         if(e instanceof bpipe.executor.ProbeCommandExecutor)
             return
             
-        if(e instanceof ThrottledDelegatingCommandExecutor)
+        if(e instanceof bpipe.PooledExecutor)
+            return
+            
+         if(e instanceof ThrottledDelegatingCommandExecutor)
             e = e.commandExecutor
         
+        e.cleanup()
+            
 		if(!commandIds.containsKey(e))
 			throw new IllegalStateException("Attempt to clean up commmand $e that was not launched by this command manager / context")
 			
@@ -241,38 +283,93 @@ class CommandManager {
      * @param commandId id of the command to move
      */
     public void cleanup(String commandId) {
-        if(!new File(this.commandDir, commandId).renameTo(new File(this.completedDir, commandId)))
-            log.warning("Unable to cleanup persisted file for command $commandId")
+        File from = new File(this.commandDir, commandId)
+        
+        // Update the command file with its latest details (runtime, etc)
+        Command command = null
+        synchronized(this.executedCommands) {
+            command = this.executedCommands.find { it.id == commandId }
+        }
+        
+        if(command) {
+            command.dir = completedDir
+            command.save()
+        }
+        else
+            log.warning("Unable to locate command $commandId as an executed command")
+            
+        from.delete()
     }
     
-    public static List<CommandExecutor> getCurrentCommands() {
+    Command readSavedCommand(String commandId) {
+        File commandFile = new File(completedDir, commandId)
+        if(!commandFile.exists()) {
+            log.info "No executed command file for $commandId exists: either it is still running or it never ran"
+            return null
+        }
         
-        List<CommandExecutor> result = []
+        log.info "Loading command $commandId"
+        commandFile.withObjectInputStream { 
+            // First saved object is the CommandExecutor
+            it.readObject(); 
+            
+            // Second is the one we want, the command itself
+            it.readObject() 
+        }
+    }
+    
+    public List<Command> getCurrentCommands() {
+        getCommandsByStatus([CommandStatus.RUNNING, CommandStatus.QUEUEING, CommandStatus.WAITING])
+    }
+    
+    public List<Command> getCommandsByStatus(List<CommandStatus> statusEnums) {
         
-        File commandsDir = new File(DEFAULT_COMMAND_DIR)
-        commandsDir.eachFileMatch(~/[0-9]+/) { File f ->
+        List<Command> result = []
+        if(!commandDir.exists()) {
+            log.info "No commands directory exists"
+        }
+        
+        File executedDir = new File(DEFAULT_EXECUTED_DIR)
+        
+        List<String> statuses = statusEnums == null ? null : statusEnums*.name()
+        [executedDir, commandDir].grep {it.exists()}*.eachFileMatch(~/[0-9]+/) { File f ->
             log.info "Loading command info from $f.absolutePath"
-            CommandExecutor cmd
+            CommandExecutor cmdExec
+            Command cmd
             try {
                 f.withObjectInputStream { 
-                    log.info "Loading command $cmd"
-                    cmd = it.readObject()
+                    cmdExec = it.readObject()
                     String status
                     try {
-                        status = cmd.status()
+                        status = cmdExec.status()
                     }
                     catch(Exception e) {
-                        log.info "Status probe for command $cmd failed: $e"
+                        println "Status probe for command $cmdExec failed: $e"
                     }
-                    if(status == CommandStatus.RUNNING)
+                    
+                    try {
+                        cmd = it.readObject()
+                    }
+                    catch(Exception e) {
+                        System.err.println "WARN: unable to read saved command $f: " + e.message
+                        return
+                    }
+                    
+                    // Update the status
+                    if(statuses == null || status in statuses) {
+                        cmd.status = CommandStatus.valueOf(status)
                         result.add(cmd) 
+                    }
+                    else
+                        log.info "Skip command with status $status"
                 }
             }
             catch(PipelineError e) {
-              System.err.println("Failed to read details for command $f.name: $cmd.\n\n${Utils.indent(e.message)}")
+              System.err.println("Failed to read details for command $f.name: $cmdExec.\n\n${Utils.indent(e.message)}")
             }
             catch(Throwable t) {
-              System.err.println("An unexpected error occured while reading details for command $f.name : $cmd.\n\n${Utils.indent(t.message)}")
+              System.err.println("An unexpected error occured while reading details for command $f.name : $cmdExec.\n\n${Utils.indent(t.message)}")
+              t.printStackTrace()
             }
         }
         return result

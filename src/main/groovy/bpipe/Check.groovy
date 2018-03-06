@@ -24,17 +24,45 @@
  */
 package bpipe
 
+import groovy.transform.CompileStatic
+import groovy.util.logging.Log
+
+/**
+ * Carries the state of a 'check' construct in Bpipe
+ * 
+ * @author Simon Sadedin
+ */
+@Log
 class Check {
     
+    String pguid
+    
     String branch
+    
+    String branchHash
     
     String stage
     
     String name
     
+    String script
+    
     Date executed
     
     boolean passed = false
+    
+	String comment
+	
+	/**
+	 * A check is in one of 4 states:
+	 * 
+	 *  <li> new
+	 *  <li> pass
+	 *  <li> review
+	 *  <li> fail
+	 *  
+	 */
+	String state = 'new'
     
     String message
     
@@ -43,14 +71,43 @@ class Check {
     boolean autoSave = false
 
     public Check() {
+        this.pguid = Config.config.pguid
+        this.script = Config.config.script
     }
+	
+	Map getEventDetails(PipelineStage pipelineStage=null) {
+	    Map details = [
+                name: this.name,
+                message: this.message,
+                pguid: this.pguid,
+				result: this.passed || this.override,
+                script: this.script,
+                stageName:this.stage,
+				stage: [stageName: this.stage],
+                branch: this.branch,
+                passed: this.passed,
+                override: this.override,
+                executed: this.executed?.time,
+                state: this.state,
+				comment: this.comment
+        ]		
+		
+		if(pipelineStage)
+			details.stage = pipelineStage
+		else 
+			details.stageName = this.stage
+			
+		return details
+	}
     
     void save() {
-        Properties p = new Properties(
-            branch: branch,
-            stage: stage,
-            passed: passed.toString()
-        )
+        
+        Properties p = new Properties()
+        p.branch = branch
+        if(branchHash)
+            p.branchHash = branchHash
+        p.stage = stage
+        p.passed = passed ? "true" : "false"
         
         if(message)
             p.message = message
@@ -61,28 +118,46 @@ class Check {
         if(this.name)
             p.name = this.name
                 
-        p.override = override.toString()
-        p.store(getFile(stage,name,branch).newWriter(), "Bpipe Check Properties")
+        
+        if(override != null)
+            p.override = override.toString()
+            
+        p.setProperty('pguid', pguid)
+        p.script = script
+		p.state = state
+        
+        if(comment != null)
+            p.comment = comment
+        
+        p.store(getFile(stage,name,branchHash).newWriter(), "Bpipe Check Properties")
     }
     
     /**
      * Return true if this check is up-to-date with respect to the given inputs
      */
     boolean isUpToDate(def inputs) {
-       File checkFile = getFile(stage, name, branch)
-       checkFile.exists() && Dependencies.instance.checkUpToDate(checkFile.absolutePath, inputs) 
+       File checkFile = getFile(stage, name, branchHash)
+       if(!checkFile.exists()) {
+           return false
+       }
+       
+       if(Dependencies.instance.getOutOfDate([checkFile.absolutePath], inputs)) {
+           return false
+       }
+       
+       return true
     }
     
     /**
      * Either load or create a new Check appropriate to the given stage name and branch
      */
-    static Check getCheck(String stageName, String name, String branch) {
-        File file = getFile(stageName, name, branch)
+    static Check getCheck(String stageName, String name, String branchHash) {
+        File file = getFile(stageName, name, branchHash)
         if(file.exists()) {
-            return new Check().load(file)
+            new Check(branchHash:branchHash).load(file)
         }
         else {
-            return new Check(stage: stageName, name:name, branch: branch, passed: false)
+            return new Check(stage: stageName, name:name, branchHash: branchHash, passed: false)
         }
     }
     
@@ -90,10 +165,10 @@ class Check {
      * Return a file for storing a check based on the branch and stage 
      * name
      */
-    static File getFile(String stageName, String name, String branch) {
-        if(branch == "")
-            branch = "all"
-        def checkName = FastUtils.dotJoin(branch,stageName,name?.toLowerCase()?.replaceAll(" ","_"),"properties")
+    static File getFile(String stageName, String name, String branchHash) {
+        if(branchHash == "")
+            branchHash = "all"
+        def checkName = FastUtils.dotJoin(branchHash,stageName,name?.toLowerCase()?.replaceAll(" ","_"),"properties")
         return new File(Checker.CHECK_DIR, checkName) 
     }
     
@@ -112,8 +187,16 @@ class Check {
         this.message = p.message ?: null
         this.passed = Boolean.parseBoolean(p.passed)
         this.override = ((p.override != null) ? Boolean.parseBoolean(p.override) : false)
+        this.pguid = p.pguid ?: null
         if(p.containsKey("name"))
             this.name = p.name
+        this.script = p.script ?: null
+		this.state = p.state  
+		if(this.state == null) { // legacy checks
+			this.state = (this.passed || this.override) ? 'succeeded' : 'failed'
+		}
+        this.comment = p.comment
+        this.branchHash = p.branchHash
         return this
     }
     
@@ -129,6 +212,20 @@ class Check {
         if(value == "" || value == null)
             value = "all"
         this.branch = value
+    }
+    
+    void overrideCheck(boolean result, String comment=null) {
+        log.info "Override me: pguid = $pguid"
+        this.override = true; 
+        this.comment = comment
+		if(result) {
+			this.state = 'pass'
+		}
+		else {
+			this.state = 'fail'
+		}
+        this.save() 
+        EventManager.instance.signal(PipelineEvent.CHECK_OVERRIDDEN, "Check overridden", getEventDetails())
     }
     
     /**

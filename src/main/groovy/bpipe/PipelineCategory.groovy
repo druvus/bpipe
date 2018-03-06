@@ -25,6 +25,7 @@
 package bpipe
 
 import groovy.lang.Closure;
+import groovy.transform.CompileStatic
 
 import java.io.FileOutputStream;
 import java.util.List;
@@ -38,11 +39,10 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import groovy.util.logging.Log;
+
 import java.util.regex.Pattern;
 
 import org.codehaus.groovy.runtime.StackTraceUtils;
-
-import static Utils.*
 
 /**
  * A category that adds default Bpipe functions to closures
@@ -107,6 +107,47 @@ class PipelineCategory {
     static String quote(String value) {
         Utils.quote(value)
     }
+    
+    static Closure power(List list, Closure c) {
+        sequentially(list,c)
+    }
+    
+    static Closure sequentially(List list, Closure c) {
+        List nameSetters = []
+        Closure result = list.collect { n -> 
+            def nameSetter = { it -> branch.name = n; return null; } 
+            
+            nameSetters << nameSetter
+            
+            return nameSetter + c(n)
+            
+        }.sum()
+        
+        Pipeline.currentUnderConstructionPipeline.joiners.addAll(nameSetters)
+        
+        return result
+    }
+    
+    static Object plus(List l, Closure c) {
+        def j = {
+            return it
+        }
+        Pipeline.currentUnderConstructionPipeline.joiners << j
+        return plus(j, l) + c
+    }
+    
+    
+    static Object plus(List l, List other) {
+        if(!l.empty && !other.empty && l[0] instanceof Closure && other[0] instanceof Closure) {
+            def j = {
+                return it
+            }
+            Pipeline.currentUnderConstructionPipeline.joiners << j
+            return plus(j, l) + other
+        }
+        else
+            return org.codehaus.groovy.runtime.DefaultGroovyMethods.plus(l,other)
+    }
 	
      /**
      * Joins two closures representing pipeline stages together by
@@ -114,6 +155,8 @@ class PipelineCategory {
      * basis of Bpipes's + syntax for joining sequential pipeline stages.
      */
     static Object plus(Closure c, Closure other) {
+        
+        // log.info "Closure["+PipelineCategory.closureNames[c] + "] + Closure[" + PipelineCategory.closureNames[other] + "]"
         
         // What we return is actually a closure to be executed later
         // when the pipeline is run.  
@@ -125,7 +168,9 @@ class PipelineCategory {
             pipeline.addStage(currentStage)
             currentStage.context.setInput(input1)
             currentStage.run()
-            Dependencies.instance.checkFiles(currentStage.context.@output)
+            
+            log.info "Checking that outputs ${currentStage.context.@output} exist"
+            Dependencies.instance.checkFiles(currentStage.context.@output, pipeline.aliases)
                     
             // If the stage did not return any outputs then we assume
             // that the inputs to the next stage are the same as the inputs
@@ -137,13 +182,13 @@ class PipelineCategory {
             }
                 
             log.info "Checking inputs for next stage:  $nextInputs"
-            Dependencies.instance.checkFiles(nextInputs)
+            Dependencies.instance.checkFiles(nextInputs, pipeline.aliases)
                 
             currentStage = new PipelineStage(pipeline.createContext(), other)
             currentStage.context.@input = nextInputs
             pipeline.addStage(currentStage)
             currentStage.run()
-            return currentStage.context.nextInputs?:currentStage.context.output
+            return currentStage.context.nextInputs?:currentStage.context.@output
         }
         Pipeline.currentUnderConstructionPipeline.joiners << result
         return result
@@ -159,11 +204,12 @@ class PipelineCategory {
         Closure mul = splitOnFiles("*", segments, false, false)
         def plusImplementation =  { input1 ->
             
-            def currentStage = new PipelineStage(Pipeline.currentRuntimePipeline.get().createContext(), other)
-            Pipeline.currentRuntimePipeline.get().addStage(currentStage)
+            Pipeline runtimePipeline = Pipeline.currentRuntimePipeline.get()
+            def currentStage = new PipelineStage(runtimePipeline.createContext(), other)
+            runtimePipeline.addStage(currentStage)
             currentStage.context.setInput(input1)
             currentStage.run()
-            Dependencies.instance.checkFiles(currentStage.context.output)
+            Dependencies.instance.checkFiles(currentStage.context.@output, runtimePipeline.aliases)
                     
             // If the stage did not return any outputs then we assume
             // that the inputs to the next stage are the same as the inputs
@@ -172,7 +218,7 @@ class PipelineCategory {
             if(nextInputs == null)
                 nextInputs = currentStage.context.@input
                 
-            Dependencies.instance.checkFiles(nextInputs)
+            Dependencies.instance.checkFiles(nextInputs, runtimePipeline.aliases)
             
             return mul(nextInputs)
         }
@@ -184,100 +230,99 @@ class PipelineCategory {
         multiply(objs.collect { String.valueOf(it) } as Set, segments)
     }
     
+    static Object multiply(String pattern, Closure c) {
+        throw new PipelineError("Multiply syntax requires a list of stages")
+    }
+    
     static Object multiply(Set objs, List segments) {
         
-        if(!objs) 
-            throw new PipelineError("Multiply syntax requires a non-empty list of files, strings, or chromosomes, but no entries were in the supplied set")
-            
         Pipeline pipeline = Pipeline.currentUnderConstructionPipeline
         
         def multiplyImplementation = { input ->
             
             log.info "multiply on input $input on set " + objs
             
+            
             def currentStage = new PipelineStage(Pipeline.currentRuntimePipeline.get().createContext(), {})
             Pipeline.currentRuntimePipeline.get().addStage(currentStage)
             currentStage.context.setInput(input)
-            
-            List chrs = []
-            chrs.addAll(objs)
-            chrs.sort()
             
             // Now we have all our inputs, make a 
             // separate pipeline for each one, and execute each parallel segment
             List<Pipeline> childPipelines = []
             List<Runnable> threads = []
-			Pipeline parent = Pipeline.currentRuntimePipeline.get()
-			Node branchPoint = parent.addBranchPoint("split")
+            Pipeline parent = Pipeline.currentRuntimePipeline.get()
+            
+            if(!objs) {
+                if(parent.branch?.name && parent.branch.name != "all") {
+                    println "MSG: Parallel segment inside branch $branch.name will not execute because the list to parallelise over is empty"
+                }
+                else {
+                    println "MSG: Parallel segment will not execute because the list to parallelise over is empty"
+                }
+            }
+            
+            List chrs = []
+            chrs.addAll(objs)
+            chrs.sort()
+            
+            Node branchPoint = parent.addBranchPoint("split")
             for(Closure s in segments) {
                 log.info "Processing segment ${s.hashCode()}"
+                
+                // ForkId is used to track distinct topological paths in the pipeline graph from 
+                // physical ones. That is, both of these run the same hello stage twice in parallel, but
+                // they are topologically different:
+                //
+                //     foo + [hello,hello]
+                //
+                //     ["a","b"] * [hello] 
+                //
+                // in the first case, they will receive different forkIds
+                // in the second case they'll have the same forkId
+                //
+                String forkId = null
                 chrs.each { chr ->
-					
-					if(!Config.config.branchFilter.isEmpty() && !Config.config.branchFilter.contains(chr)) {
-						System.out.println "Skipping branch $chr because not in branch filter ${Config.config.branchFilter}"
-						return
-					}
+                    
+                    if(!Config.config.branchFilter.isEmpty() && !Config.config.branchFilter.contains(chr)) {
+                        System.out.println "Skipping branch $chr because not in branch filter ${Config.config.branchFilter}"
+                        return
+                    }
                     
                     log.info "Creating pipeline to run on branch $chr"
-                    Pipeline child = Pipeline.currentRuntimePipeline.get().fork(branchPoint, chr.toString())
+                    Pipeline child = Pipeline.currentRuntimePipeline.get().fork(branchPoint, chr.toString(), forkId)
+                    forkId = child.id
                     currentStage.children << child
                     Closure segmentClosure = s
                     threads << {
             
                         try {
                             
-                            // First we make a "dummy" stage that contains the inputs
-                            // to the next stage as outputs.  This allows later logic
-                            // to find these "inputs" correctly when it expects to see
-                            // all "inputs" reflected as some output of an earlier stage
-                            PipelineContext dummyPriorContext = pipeline.createContext()
-                            PipelineStage dummyPriorStage = new PipelineStage(dummyPriorContext,{})
-                            dummyPriorContext.stageName = dummyPriorStage.stageName = "Nested pipeline segment: $chr"
-                                
                             // If the filterInputs option is set, match input files on the region name
                             def childInputs = input
                             
-                            def filterInputs = chr instanceof Chr ? chr.config?.filterInputs : "auto"
-                            
-                            if(filterInputs == "auto") { 
-                                if(Config.userConfig.autoFilter!="false") {
-//                                    log.info "Checking for auto filter - inputs matching chr pattern are: " + Utils.box(input).grep { it.matches(/.*\.chr[1-9A-Z_]*\..*$/) }
-                                    filterInputs = Utils.box(input).any { it.matches(/.*\.chr[1-9A-Z_]*\..*$/) }
-                                }
-                                else
-                                    filterInputs = false
-                            }
-                            
-                            if(filterInputs && (chr instanceof Chr)) {
-                                log.info "Filtering child pipeline inputs on name $chr.name"
-                                
-                                childInputs  = Utils.box(input).grep { i -> (i.indexOf('.' + chr.name + '.')>0) }
-                                    
-                                // Since the name of the region is already in the file path, it does not need
-                                // to be applied again to output files
-                                child.nameApplied = true
-                                    
-                                if(!childInputs) {
-                                    println "MSG: Skipping region ${chr.name} because no matching inputs were found"
+                            child.branch = new Branch()
+                            if(chr instanceof Chr) {
+                                childInputs = initChildFromChr(child,chr,input)
+                                if(childInputs == null)
                                     return
-                                }
                             }
-                                
-                            // Note: must be raw output because otherwise the original inputs (from other folders)
-                            // can get redirected to the output folder
-                            dummyPriorContext.setRawOutput(childInputs)
-                                
-                            log.info "Adding dummy prior stage for thread ${Thread.currentThread().id} with outputs : $dummyPriorContext.output"
+                            else
+                            if(chr instanceof RegionSet) {
+                                initChildFromRegionSet(child, chr)
+                            }
+                            else {
+                                child.branch.@name = String.valueOf(chr)
+                            }
+                            
+                            PipelineStage dummyPriorStage = createFilteredInputStage(chr, Utils.box(childInputs), pipeline)
                             child.addStage(dummyPriorStage)
-                            def region = chr instanceof Chr ? chr.region : ""
-                            child.variables += [chr: region]
-                            child.variables += [region: region]
-                            child.branch = new Branch(name:chr instanceof Chr ? chr.name : chr)
                             child.runSegment(childInputs, segmentClosure)
                         }
                         catch(Exception e) {
                             log.log(Level.SEVERE,"Pipeline segment in thread " + Thread.currentThread().name + " failed with internal error: " + e.message, e)
                             Runner.reportExceptionToUser(e)
+                            Concurrency.instance.unregisterResourceRequestor(child)
                             child.failed = true
                         }
                     } as Runnable
@@ -287,10 +332,111 @@ class PipelineCategory {
             return runAndWaitFor(currentStage, childPipelines, threads)
         }
         
-        log.info "Joiners for pipeline " + pipeline.hashCode() + " = " + pipeline.joiners
+//        log.info "Joiners for pipeline " + pipeline.hashCode() + " = " + pipeline.joiners
         pipeline.joiners << multiplyImplementation
         
         return multiplyImplementation
+    }
+    
+    /**
+     * Create a fake pipeline stage that exists for the purpose of setting 
+     * a particular set of inputs to a child branch
+     * 
+     * @param branchObject  object that identifies the branch
+     * @param childInputs   input set that the child branch should see
+     * @param pipeline      pipeline that will be the parent of the child branch
+     * 
+     * @return  a PipelineStage object that will filter inputs to the list 
+     *          given
+     */
+    @CompileStatic
+    static PipelineStage createFilteredInputStage(def branchObject, List childInputs, Pipeline pipeline) {
+        // First we make a "dummy" stage that contains the inputs
+        // to the next stage as outputs.  This allows later logic
+        // to find these "inputs" correctly when it expects to see
+        // all "inputs" reflected as some output of an earlier stage
+        PipelineContext dummyPriorContext = pipeline.createContext()
+        PipelineStage dummyPriorStage = new PipelineStage(dummyPriorContext,{})
+        dummyPriorContext.stageName = dummyPriorStage.stageName = "_${branchObject}_inputs"
+                                
+        // Note: must be raw output because otherwise the original inputs (from other folders)
+        // can get redirected to the output folder
+        dummyPriorContext.setRawOutput(childInputs)
+        
+        log.info "Created dummy prior stage for thread ${Thread.currentThread().id} with outputs : $dummyPriorContext.output"
+        return dummyPriorStage
+    }
+    
+    static void initChildFromRegionSet(Pipeline child, RegionSet regions) {
+        RegionValue regionValue = 
+            new RegionValue(value: regions.sequences.collect { 
+                it.value.toString() 
+            }.flatten().join(" "))
+                                        
+        child.variables.region = regionValue
+        child.branch.region = regionValue
+        child.branch.chr = regions.sequences.keySet().iterator().next()
+        
+        log.info "Set region value for $child to $regionValue"
+    }
+    
+    /**
+     * Configure a child pipeline to execute for a specific chromosome
+     * 
+     * @param child
+     * @param chr
+     * @return a list of inputs to use for the child, or null if the child should not execute
+     */
+    static def initChildFromChr(Pipeline child, Chr chr, def input) {
+        
+        def childInputs = input 
+        if(childInputs == null)
+            childInputs = []
+        
+        String chrName = chr.name
+        
+        def filterInputs = chr instanceof Chr ? chr.config?.filterInputs : "auto"
+                            
+        if(filterInputs == "auto") { 
+            if(Config.userConfig.autoFilter!="false") {
+                // log.info "Checking for auto filter - inputs matching chr pattern are: " + Utils.box(input).grep { it.matches(/.*\.chr[1-9A-Z_]*\..*$/) }
+                filterInputs = Utils.box(input).any { it.matches(/.*\.chr[1-9A-Z_]*\..*$/) }
+            }
+            else
+                filterInputs = false
+        }
+                            
+        if(filterInputs && (chr instanceof Chr)) {
+            log.info "Filtering child pipeline inputs on name $chr.name"
+                                
+            childInputs  = Utils.box(input).grep { i -> (i.indexOf('.' + chr.name + '.')>0) }
+                                    
+            // Since the name of the region is already in the file path, it does not need
+            // to be applied again to output files
+            child.nameApplied = true
+                                    
+            if(!childInputs) {
+                println "MSG: Skipping region ${chr.name} because no matching inputs were found"
+                Concurrency.instance.unregisterResourceRequestor(child)
+                return null
+            }
+        }
+        
+        child.branch = new Branch()
+        child.variables.chr = chrName
+        child.branch.name = chrName
+        child.branch.chr = chrName
+        if(Pipeline.defaultGenome) {
+            Map<String,Integer> chromSizes = Pipeline.genomeChromosomeSizes[Pipeline.defaultGenome]
+            log.info "Checking if chromosome sizes available for " + Pipeline.defaultGenome + " (chromSizes[$chrName]=${chromSizes[chrName]})"
+            if(chromSizes && chromSizes[chrName]) {
+                child.branch.region = chrName + ':0-' + chromSizes[chrName]
+                child.variables.region = chrName + ':0-' + chromSizes[chrName]
+                log.info "Set child branch region for chr $chrName to $child.branch.region based on " + chromSizes[chrName]
+            }
+        }
+        
+        return childInputs
     }
     
     static Object multiply(java.util.regex.Pattern pattern, List segments) {
@@ -319,10 +465,10 @@ class PipelineCategory {
             // Map filteredBranches = branches.keySet().collectEntries { key -> 
             //   [key, Utils.box(branches[key]).removeAll { !(it in inputs) }]
             //}
-            splitOnMap(branches,segments)
+            splitOnMap(input, branches,segments)
         }
         
-        log.info "Joiners for pipeline " + pipeline.hashCode() + " = " + pipeline.joiners
+//        log.info "Joiners for pipeline " + pipeline.hashCode() + " = " + pipeline.joiners
         pipeline.joiners << multiplyImplementation
         return multiplyImplementation
     }
@@ -367,7 +513,7 @@ class PipelineCategory {
             
             if(samples.isEmpty()) 
                 if(input)
-                    throw new PipelineError("The pattern provided '$pattern' did not match any of the files provided as input $input")
+                    println("Note: a pattern '$pattern' was provided, but did not match any of the files provided as input $input.")
                 else
                     throw new PatternInputMissingError("An input pattern was specified '$pattern' but no inputs were given when Bpipe was run.")
                     
@@ -375,7 +521,7 @@ class PipelineCategory {
         }
 					
         
-        log.info "Joiners for pipeline " + pipeline.hashCode() + " = " + pipeline.joiners
+//        log.info "Joiners for pipeline " + pipeline.hashCode() + " = " + pipeline.joiners
         pipeline.joiners << multiplyImplementation
         
         return multiplyImplementation
@@ -392,8 +538,11 @@ class PipelineCategory {
         }
         
         PipelineStage currentStage = new PipelineStage(pipeline.createContext(), {})
-        Pipeline.currentRuntimePipeline.get().addStage(currentStage)
+        Pipeline parent = Pipeline.currentRuntimePipeline.get()
+        parent.addStage(currentStage)
         currentStage.context.setInput(input)
+        
+        parent.childCount = 0
             
         log.info "Created pipeline stage ${currentStage.hashCode()} for parallel block"
         
@@ -401,11 +550,12 @@ class PipelineCategory {
         // separate pipeline for each one, and for each parallel stage
         List<Pipeline> childPipelines = []
         List<Runnable> threads = []
-		Pipeline parent = Pipeline.currentRuntimePipeline.get()
 		Node branchPoint = parent.addBranchPoint("split")
         for(Closure s in segments) {
             log.info "Processing segment ${s.hashCode()}"
-
+            
+            // See note in multiply(Set objs, List segments) for details on the purpose of forkId
+            String forkId = null
             samples.each { id, files ->
                     
                 log.info "Creating pipeline to run parallel segment $id with files $files. Branch filter = ${Config.config.branchFilter}"
@@ -424,8 +574,9 @@ class PipelineCategory {
                     else
                         childName = id + "." + segmentNumber
                 }
-				
-                Pipeline child = parent.fork(branchPoint,childName)
+                
+                Pipeline child = parent.fork(branchPoint,childName, forkId)
+                forkId = child.id
                 currentStage.children << child
                 threads << {
                     try {
@@ -448,7 +599,7 @@ class PipelineCategory {
                     }
                     catch(Exception e) {
                         log.log(Level.SEVERE,"Pipeline segment in thread " + Thread.currentThread().name + " failed with internal error: " + e.message, e)
-                        StackTraceUtils.sanitize(e).printStackTrace()
+                        println(Utils.prettyStackTrace(e))
                         child.failExceptions << e
                         child.failed = true
                     }
@@ -461,18 +612,44 @@ class PipelineCategory {
     
     static runAndWaitFor(PipelineStage currentStage, List<Pipeline> pipelines, List<Runnable> threads) {
             // Start all the threads
-            Concurrency.instance.execute(threads)
+        
+            Pipeline current = Pipeline.currentRuntimePipeline.get()
+            
+            pipelines.each { 
+                Concurrency.instance.registerResourceRequestor(it)
+            }
+            
+            try {
+                current.isIdle = true
+                Concurrency.instance.execute(threads, current.branchPath.size())
+            }
+            finally {
+                current.isIdle = false
+            }
             
             if(pipelines.any { it.failed }) {
                 def messages = summarizeErrors(pipelines)
                 
-                Pipeline current = Pipeline.currentRuntimePipeline.get()
                 for(Pipeline p in pipelines.grep { it.failed }) {
-                    current.failExceptions.addAll(p.failExceptions)
+                    // current.failExceptions.addAll(p.failExceptions)
                 }
                 current.failReason = messages
                 
-                throw new PipelineError("One or more parallel stages aborted. The following messages were reported: \n\n" + messages)
+                List<PipelineError> childFailures = pipelines.grep { it.failed }*.failExceptions.flatten()
+                
+                Exception e
+                if(pipelines.every { p -> p.failExceptions.every { it instanceof PipelineTestAbort } }) {
+                   e = new PipelineTestAbort()
+                }
+                else {
+                   e = new SummaryErrorException(childFailures)
+                }
+                e.summary = true
+                throw e
+            }
+            else
+            if(pipelines.isEmpty()) {
+                return null
             }
             else {
                 if(pipelines.every { it.aborted }) {
@@ -568,18 +745,55 @@ class PipelineCategory {
             new PipelineContext(null, parent.stages, joiners, new Branch(name:'all'))
         def mergedOutputs = finalStages.collect { s ->
             Utils.box(s?.context?.nextInputs ?: s?.context?.@output) 
-        }.sum().unique { new File(it).canonicalPath }
+        }.sum().collect { Utils.canonicalFileFor(it).path }.unique()
+        
         log.info "Last merged outputs are $mergedOutputs"
         mergedContext.setRawOutput(mergedOutputs)
-        PipelineStage mergedStage = new PipelineStage(mergedContext, finalStages.find { it != null }.body)
-        mergedStage.stageName = Utils.removeRuns(finalStages*.stageName).join("_")+"_bpipe_merge"
+        
+        Closure flattenedBody = finalStages.find { it != null }?.body
+        if(flattenedBody == null) {
+            flattenedBody = {}
+        }
+        
+        PipelineStage mergedStage = new FlattenedPipelineStage(
+                mergedContext, 
+                flattenedBody,
+                finalStages
+            )
         log.info "Merged stage name is $mergedStage.stageName"
-        parent.stages.add(mergedStage)
+        parent.addStage(mergedStage)
         
         return mergedOutputs
     }
     
     static String summarizeErrors(List<Pipeline> pipelines) {
+        
+        // Need to associate each exception to a pipeline
+        Map<Throwable,Pipeline> exPipelines = [:]
+        pipelines.each { Pipeline p -> p.failExceptions.each { ex -> exPipelines[ex] = p } }
+        
+        pipelines*.failExceptions
+                  .flatten()
+                  .groupBy { it.message }
+                  .collect { String msg, List<Throwable> t ->
+                      
+                        if(t instanceof SummaryErrorException) {
+                            
+                            assert t.summarisedErrors.every { (!it instanceof SummaryErrorException) }
+                            return t.summarisedErrors*.message.join("\n")
+                        }
+                        
+                        List<String> branches = t.collect { exPipelines[it] }*.branchPath.flatten()
+                        
+                        List<String> stages = t.grep { it instanceof PipelineError && it.ctx != null }.collect { it.ctx.stageName }.unique()
+                        
+                        """
+                            Branch${branches.size()>1?'es':''} ${branches.join(", ")} in stage${stages.size()>1?'s':''} ${stages.join(", ")} reported message:
+            
+                       """.stripIndent() + msg 
+                  }.join("\n")
+        
+        /*
         pipelines.collect { 
                     if(it.failReason && it.failReason!="Unknown") 
                         return it.failReason
@@ -589,6 +803,7 @@ class PipelineCategory {
                     else
                     return null
         }.grep { it }.flatten().unique().join('\n') 
+        */
     }
     
     static void addStages(Binding binding) {

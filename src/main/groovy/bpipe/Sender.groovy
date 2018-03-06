@@ -24,7 +24,9 @@
  */
 package bpipe
 
-import groovy.lang.Closure;
+import java.util.logging.Level
+
+import groovy.json.JsonOutput
 import groovy.util.logging.Log;
 import groovy.xml.MarkupBuilder
 
@@ -72,6 +74,13 @@ class Sender {
         this.content = c()
         this.contentType = "text/plain"
         this.defaultSubject = Utils.truncnl(content,80)
+        return this
+    }
+    
+    Sender json(Closure c) {
+        this.content = JsonOutput.toJson(c())
+        this.contentType = "application/json"
+        this.defaultSubject = "JSON content from stage ${ctx.stageName}"
         return this
     }
     
@@ -147,7 +156,7 @@ class Sender {
             cfgName = "file"
         }
         
-        if(cfgName.startsWith('$'))
+        if(cfgName?.startsWith('$'))
             cfgName = cfgName.substring(1)
         
         if(details == null) {
@@ -171,7 +180,7 @@ class Sender {
        String contentHash = (content instanceof File) ? content.absolutePath + content.length() : content
        
        File sentFile = new File(sentFolder, cfgName + "." + ctx.stageName + "." + Utils.sha1(this.details.subject + content))
-       if(sentFile.exists() && Dependencies.instance.checkUpToDate(sentFile.absolutePath, ctx.@input)) {
+       if(sentFile.exists() && !Dependencies.instance.getOutOfDate([sentFile.absolutePath], ctx.@input)) {
            log.info "Sent file $sentFile.absolutePath already exists - skipping send of this message"
            if(onSend != null) {
              onSend(details)
@@ -195,12 +204,29 @@ class Sender {
        else
            log.info "Sending $content to $cfgName"
        
-       NotificationManager.instance.sendNotification(cfgName, PipelineEvent.SEND, this.details.subject, [
+           
+       Map props = [
+            "stage" : ctx.currentStage,
             "send.content": content,
             "send.subject": this.details.subject,
             "send.contentType" : this.contentType,
             "send.file" : this.details.file
-        ]) 
+        ]
+        
+       if(details.containsKey('url')) {
+           sendToURL(details)
+       }
+       else {
+           NotificationManager.instance.sendNotification(cfgName, PipelineEvent.SEND, this.details.subject, props) 
+       }
+       
+       // The file can actually be a PipelineOutput or similar which leads to 
+       // bizarre errors when serializing to JSON because the whole PipelineContext
+       // gets captured in there
+       props['send.file'] = String.valueOf(props['send.file'])
+       
+       EventManager.instance.signal(PipelineEvent.SEND, this.details.subject, props)
+       
        
        if(ctx.currentCheck && ctx.currentCheck.message != details.subject) {
            ctx.currentCheck.message = details.subject
@@ -210,6 +236,70 @@ class Sender {
        if(onSend != null) {
            onSend(details)
        }
+    }
+    
+    void sendToURL(Map details) {
+        
+        def contentIn = resolveJSONContentSource()
+        
+        String url = details.url
+        if(details.params) {
+            if(!url.contains('?'))
+                url += '?'
+            
+            url += details.params.collect { key, value -> URLEncoder.encode(key) + '=' + URLEncoder.encode(value) }.join('&')
+        }
+        
+        log.info "Sending to $details.url with content type $contentType"
+        try {
+            connectAndSend(contentIn, url)
+        }
+        finally {
+            if(contentIn.respondsTo('close'))
+                contentIn.close()
+        }
+    }
+    
+    def resolveJSONContentSource() {
+        def contentIn = this.content
+            
+        if((contentIn instanceof PipelineInput) || (contentIn instanceof String)) {
+            contentIn = new File(contentIn).newInputStream()
+        }
+        else
+        if(contentIn instanceof File)
+            contentIn = contentIn.newInputStream()
+        else
+        if(contentIn instanceof Map || contentIn instanceof List) {
+            contentIn = JsonOutput.toJson(contentIn)
+        }
+        return contentIn
+    }
+    
+    void connectAndSend(def contentIn, String url) {
+        new URL(url).openConnection().with {
+            doOutput = true
+            useCaches = false
+            setRequestProperty('Content-Type',this.contentType)
+            requestMethod = 'POST'
+                
+            connect()
+                
+            outputStream.withWriter { writer ->
+              writer << contentIn
+            }
+            log.info "Sent to URL $details.url"
+                
+            int code = getResponseCode()
+            log.info("Received response code $code from server")
+            if(code >= 400) {
+                String output = errorStream.text
+                throw new PipelineError("Send to $details.url failed with error $code. Response contains: ${output.take(80)}")
+            }
+                    
+            if(log.isLoggable(Level.FINE))
+                log.fine content.text
+        }
     }
     
     /**

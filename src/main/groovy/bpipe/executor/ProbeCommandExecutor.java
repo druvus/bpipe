@@ -25,7 +25,6 @@
  */
 package bpipe.executor;
 
-import java.io.File;
 import java.util.List;
 import java.util.Map;
 
@@ -44,8 +43,7 @@ public class ProbeCommandExecutor implements CommandExecutor {
     private static final long serialVersionUID = 1L;
 
     @Override
-    public void start(Map cfg, Command command, File outputDirectory) {
-
+    public void start(Map cfg, Command command, Appendable outputLog, Appendable errorLog) {
     }
 
     @Override
@@ -68,6 +66,11 @@ public class ProbeCommandExecutor implements CommandExecutor {
     @Override
     public List<String> getIgnorableOutputs() {
         return null;
+    }
+
+    @Override
+    public String statusMessage() {
+        return "Probe command executor";
     }
 
 }

@@ -1,3 +1,4 @@
+
 /*
  * Copyright (c) 2012 MCRI, authors
  *
@@ -24,6 +25,7 @@
  */
 package bpipe.executor
 
+import groovy.text.SimpleTemplateEngine;
 import groovy.util.logging.Log
 import bpipe.Command;
 import bpipe.ForwardHost
@@ -32,13 +34,16 @@ import bpipe.PipelineError
 import bpipe.CommandStatus
 
 /**
- * Implements a command executor based on the Sun Grid Engine (SGE) resource manager 
- * 
+ * Implements a command executor based on the Sun Grid Engine (SGE) resource manager
+ * <p>
+ *
  * @author Paolo Di Tommaso <paolo.ditommaso@gmail.com>
  */
 @Mixin(ForwardHost)
 @Log
 class SgeCommandExecutor implements CommandExecutor {
+    
+    public static final long serialVersionUID = 520230130470104528L;
 
     private Map config;
 
@@ -50,169 +55,212 @@ class SgeCommandExecutor implements CommandExecutor {
     private String cmd;
 
     private String jobDir;
-	
+
     /* Mark the job as stopped by the user */
     private boolean stopped
 
     /* The ID of the job as returned by the JOB scheduler */
-	private String commandId;
-    
+    private String commandId;
+
     /** Command object - only used for updating status */
     Command command
-	
-	private static String CMD_EXIT_FILENAME = "cmd.exit"
-	
-	private static String CMD_SCRIPT_FILENAME = "cmd.sh"
 
-    private static String CMD_OUT_FILENAME = "cmd.out"
-
-    private static String CMD_ERR_FILENAME = "cmd.err"
-
-	/**
-	 * Start the execution of the command in the SGE environment. 
-	 * <p> 
-	 * The command have to be wrapper by a script shell that will be specified on the 'qsub' command line. 
-	 * This method does the following 
-	 * - Create a command script wrapper named '.cmd.sh' in the job execution directory 
-	 * - Redirect the command stdout to the file ..
-	 * - Redirect the command stderr to the file ..
-	 * - The script wrapper save the command exit code in a file named '.cmd.exit' containing
-	 *   the job exit code. To monitor for job termination will will wait for that file to exist
-	 */
+    private static String CMD_FILENAME = "cmd_run.sh"
+    
+    /**
+     * Start the execution of the command in the SGE environment.
+     * <p>
+     * The command have to be wrapper by a script shell that will be specified on the 'qsub' command line.
+     * This method does the following
+     * - Create a command script wrapper named '.cmd.sh' in the job execution directory
+     * - Redirect the command stdout to the file ..
+     * - Redirect the command stderr to the file ..
+     * - The script wrapper save the command exit code in a file named '.cmd.exit' containing
+     *   the job exit code. To monitor for job termination will will wait for that file to exist
+     */
     @Override
-    void start(Map cfg, Command command, File outputDirectory) {
+    void start(Map cfg, Command command, Appendable outputLog, Appendable errorLog) {
         this.config = cfg
         this.id = command.id
         this.name = command.name;
         this.cmd = command.command?.trim();
         this.command = command
-        
+
         this.jobDir = ".bpipe/commandtmp/$id"
         File jobDirFile = new File(this.jobDir)
         if(!jobDirFile.exists()) {
             jobDirFile.mkdirs()
         }
-
+ 
         // If an account is specified by the config then use that
         log.info "Using account: $config?.account"
-		
-		/*
-		 * Create '.cmd.sh' wrapper used by the 'qsub' command
-		 */
-		def cmdWrapperScript = new File(jobDir, CMD_SCRIPT_FILENAME)
-		cmdWrapperScript.text =  
-			"""\
-			#!/bin/sh
-			${cmd}
-			result=\$?
-			echo -n \$result > $jobDir/$CMD_EXIT_FILENAME
-			exit \$result
-			"""
-			.stripIndent()
-		
-		/*
-		 * Prepare the 'qsub' cmdline. The following options are used
-		 * - wd: define the job working directory 
-		 * - terse: output just the job id on the output stream
-		 * - o: define the file to which redirect the standard output
-		 * - e: define the file to which redirect the error output 
-		 */
-		def startCmd = "qsub -wd \$PWD -terse -o $jobDir/$CMD_OUT_FILENAME -e $jobDir/$CMD_ERR_FILENAME -V "
-		// add other parameters (if any)
-		if(config?.queue) {
-			startCmd += "-q ${config.queue} "
-		}
 
-        if( config?.walltime )  {
-            startCmd += "-l h_rt=${config.walltime} "
+        /*
+         * Prepare the 'qsub' cmdline. The following options are used
+         * - wd: define the job working directory
+         * - terse: output just the job id on the output stream
+         * - o: define the file to which redirect the standard output
+         * - e: define the file to which redirect the error output
+         */
+        
+        List<String> submitOpts = []
+        if(config?.containsKey("pass_env") && config.pass_env == false) {
+            submitOpts << "-V"
         }
-
-        if( config?.procs && config.procs.toString().isInteger() ) {
-            startCmd +=  "-l slots=${config.procs} "
+            
+        if(config?.containsKey("custom_submit_options"))
+            submitOpts << String.valueOf(config.custom_submit_options)
+        
+        def startCmd = "qsub ${submitOpts.join(' ')} -notify -terse ".tokenize(" ")
+        
+        // add other parameters (if any)
+        if(config?.queue) {
+            startCmd += ["-q", config.queue]
         }
-        else if ( config?.procs ) {
-            startCmd += "-pe ${config.procs} "
+        
+        if(config.containsKey('sge_request_options') && config.sge_request_options) {
+            // todo: spaces in sge options?
+            startCmd += config.sge_request_options.tokenize(' ')
         }
+        
+        // at the end append the command script wrapped file name
+        startCmd << "$jobDir/$CommandTemplate.CMD_SCRIPT_FILENAME".toString()
+    
+        def cmdScript = new File(jobDir, CMD_FILENAME)
+        cmdScript.text = cmd
+    
+        // This is providing backwards compatibility for the original format
+        // of the procs parameter supported in the form "orte 1"
+        if(config?.procs && !config.procs.toString().isInteger()) {
+            def parts = config.procs.toString().split(' ')
+            if(parts.size() == 1)
+                throw new Exception("Bad format for SGE procs parameter: " + config.procs + ". Expect either integer or form: '<pe> <integer>'")
 
-        if( config?.memory ) {
-            /*
-             * Read more about SGE virtual_free vs mem_free at the following links
-             * http://gridengine.org/pipermail/users/2011-December/002215.html
-             * http://www.gridengine.info/tag/virtual_free/
-             */
-            startCmd += "-l virtual_free=${config.memory} "
+            // try not to mess with the original config - it could be used in other places
+            config = config.clone()
+            config.procs = parts[1].toInteger()
+            config.sge_pe = parts[0].trim()
         }
-
-        if( config?.sge_request_options ) {
-            startCmd += config.sge_request_options + ' '
+        
+        Map props = config + [
+                config : config, 
+                cmd : cmd,
+                name : name,
+                jobDir : jobDir,
+                CMD_FILENAME : cmdScript,
+                CMD_OUT_FILENAME : CMD_OUT_FILENAME,
+                CMD_ERR_FILENAME : CMD_ERR_FILENAME,
+                CMD_EXIT_FILENAME : CMD_EXIT_FILENAME
+        ]
+        
+        new CommandTemplate().populateCommandTemplate(new File(jobDir), "executor/sge-command.template.sh", props)
+        
+        /*
+         * prepare the command to invoke
+         */
+        log.info "Starting command: '${startCmd}'"
+        
+        Map<String,Object> startResult = Utils.executeCommand(startCmd)
+        
+        if(startResult.exitValue != 0) {
+            reportStartError(startCmd, startResult.out,startResult.err,startResult.exitValue)
+            throw new PipelineError("Failed to start command:\n\n$cmd")
         }
-		
-		// at the end append the command script wrapped file name
-		startCmd += "$jobDir/$CMD_SCRIPT_FILENAME"
-		
-		/*
-		 * prepare the command to invoke
-		 */
-		log.info "Starting command: '${startCmd}'"
-		
-		ProcessBuilder pb = new ProcessBuilder("bash", "-c", startCmd)
-		Process p = pb.start()
-		Utils.withStreams(p) {
-			StringBuilder out = new StringBuilder()
-			StringBuilder err = new StringBuilder()
-			p.waitForProcessOutput(out, err)
-			int exitValue = p.waitFor()
-			if(exitValue != 0) {
-				reportStartError(startCmd, out,err,exitValue)
-				throw new PipelineError("Failed to start command:\n\n$cmd")
-			}
-			this.commandId = out.toString().trim()
-			if(this.commandId.isEmpty())
-				throw new PipelineError("Job runner ${this.class.name} failed to return a job id despite reporting success exit code for command:\n\n$startCmd\n\nRaw output was:[" + out.toString() + "]")
-				
-			log.info "Started command with id $commandId"
-		}
+        this.commandId = startResult.out.toString().trim()
+        if(this.commandId.isEmpty())
+            throw new PipelineError("Job runner ${this.class.name} failed to return a job id despite reporting success exit code for command:\n\n$startCmd\n\nRaw output was:[" + out.toString() + "]")
 
-
+        log.info "Started command with id $commandId"
 
         // After starting the process, we launch a background thread that waits for the error
         // and output files to appear and then forward those inputs
-        forward("$jobDir/$CMD_OUT_FILENAME", System.out)
-        forward("$jobDir/$CMD_ERR_FILENAME", System.err)
-		
+        forward("$jobDir/$CMD_OUT_FILENAME", outputLog)
+        forward("$jobDir/$CMD_ERR_FILENAME", errorLog)
     }
-	
-	
-	void reportStartError(String cmd, def out, def err, int exitValue) {
-		log.severe "Error starting custom command using command line: " + cmd
-		System.err << "\nFailed to execute command using command line: $cmd\n\nReturned exit value $exitValue\n\nOutput:\n\n$out\n\n$err"
-	}
+
+    void reportStartError(def cmd, def out, def err, int exitValue) {
+        log.severe "Error starting custom command using command line: " + cmd
+        System.err << "\nFailed to execute command using command line: $cmd\n\nReturned exit value $exitValue\n\nOutput:\n\n$out\n\n$err"
+    }
 
     @Override
     String status() {
         String result = statusImpl()
         return this.command.status = result
     }
-    
+
     /**
      * @return The current status as defined by {@link bpipe.CommandStatus}
      */
     String statusImpl() {
-		
-		if( !new File(jobDir, CMD_SCRIPT_FILENAME).exists() ) {
-			return CommandStatus.UNKNOWN
-		}
-		
-		if( !commandId ) {
-			return CommandStatus.QUEUEING	
-		}
-		
-		File resultExitFile = new File(jobDir, CMD_EXIT_FILENAME )
-		if( !resultExitFile.exists() ) {
-			return CommandStatus.RUNNING
-		}  
-		
-		return CommandStatus.COMPLETE
+
+        if( !new File(jobDir,CommandTemplate.CMD_SCRIPT_FILENAME).exists() ) {
+            return CommandStatus.UNKNOWN
+        }
+
+        if( !commandId ) {
+            return CommandStatus.QUEUEING
+        }
+        
+        if(!new File(jobDir,CMD_OUT_FILENAME).exists()) {
+            return CommandStatus.WAITING
+        }
+
+        File resultExitFile = new File(jobDir, CMD_EXIT_FILENAME )
+        if(!resultExitFile.exists() ) {
+            
+            // try to probe actual state of command
+            CommandStatus newStatus = probeStatus()
+            return newStatus
+        }
+
+        return CommandStatus.COMPLETE
+    }
+    
+    CommandStatus probeStatus() {
+        
+        List probeCommand = ["qstat","-j", commandId]
+        
+        log.info "Probing state of command $commandId using command $probeCommand"
+        
+        Map probeResult = Utils.executeCommand(probeCommand)
+        if(probeResult.exitValue != 0) {
+            
+            String err = String.valueOf(probeResult.err)
+            if(err.contains("do not exist")) {
+                log.info "Probe for status of command $commandId returned non-zero exit code with message: '$err'. command is likely finished"
+                return CommandStatus.COMPLETE
+            }
+            else {
+                println "Probe for job $commandId returned error code $probeResult.exitValue with message $err."
+                return CommandStatus.UNKNOWN
+            }
+        }
+        
+        try {
+            String state = probeResult.out.toString().readLines().grep { it.startsWith('job_state') }[0].tokenize(' ')[-1]
+            
+            switch(state) {
+                case 'r':
+                    return CommandStatus.RUNNING
+                    
+                case 'dr':
+                case 'd':
+                case 'c':
+                    return CommandStatus.COMPLETE
+                    
+                default:
+                    println "Unrecognized command state: " + state
+                    return CommandStatus.UNKNOWN
+            }
+        }
+        catch(Exception e) {
+            println "Unrecognized format for qstat output in status probe for command $commandId (see log for output)"
+            log.info "Received unexpected output from qstat\n: $probeResult"
+            return CommandStatus.UNKNOWN
+        }
+        
+        return probeResult
     }
 
     /**
@@ -221,32 +269,33 @@ class SgeCommandExecutor implements CommandExecutor {
      */
     @Override
     int waitFor() {
-		
-		int count=0
-		File exitFile = new File( jobDir, CMD_EXIT_FILENAME )
-		while( !stopped ) {
-			
-			if( exitFile.exists() ) {
-				def val = exitFile.text?.trim()
-				if( val.isInteger() ) {
-					// ok. we get the value as integer
+
+        int count=0
+        File exitFile = new File( jobDir, CMD_EXIT_FILENAME )
+        log.info "SGE executor waiting for command $commandId, complete when file $exitFile exists"
+        while( !stopped ) {
+
+            if( exitFile.exists() ) {
+                def val = exitFile.text?.trim()
+                if( val.isInteger() ) {
+                    // ok. we get the value as integer
                     command.status = CommandStatus.COMPLETE.name()
-					return new Integer(val)	
-				}	
-				
-				/*
-				 * This could happen if there are latency in the file system.
-				 * Try to wait and re-try .. if nothing change make it fail after a fixed amount of time
-				 */
-				Thread.sleep(500)
-				if( count++ < 10 ) { continue }
-				log.warn("Missing exit code value for command: '${id}'. Retuning -1 by default")
-				return -1
-			}
-			
-		
-			Thread.sleep(5000)	
-		}
+                    return new Integer(val)
+                }
+
+                /*
+                 * This could happen if there are latency in the file system.
+                 * Try to wait and re-try .. if nothing change make it fail after a fixed amount of time
+                 */
+                Thread.sleep(500)
+                if( count++ < 10 ) { continue }
+                log.warning("Missing exit code value for command: '${id}'. Retuning -1 by default")
+                return -1
+            }
+
+
+            Thread.sleep(5000)
+        }
 
         return -1
     }
@@ -260,35 +309,34 @@ class SgeCommandExecutor implements CommandExecutor {
         // mark the job as stopped
         // this will break the {@link #waitFor} method as well
         stopped = true
-		
-		String cmd = "qdel $commandId"
-		log.info "Executing command to stop command $id: $cmd"
 
-		int exitValue
-		StringBuilder err
-		StringBuilder out
+        String cmd = "qdel $commandId"
+        log.info "Executing command to stop command $id: $cmd"
 
-		err = new StringBuilder()
-		out = new StringBuilder()
-		Process p = Runtime.runtime.exec(cmd)
-		Utils.withStreams(p) {
-			p.waitForProcessOutput(out,err)
-			exitValue = p.waitFor()
-		}
-		
-		if( !exitValue ) {
-			
-			def msg = "SGE failed to stop command $id, returned exit code $exitValue from command line: $cmd"
-			log.severe "Failed stop command produced output: \n$out\n$err"
-			if(!err.toString().trim().isEmpty()) {
-				msg += "\n" + Utils.indent(err.toString())
-			}
-			throw new PipelineError(msg)
+        int exitValue
+        StringBuilder err
+        StringBuilder out
 
-		}
-        
-		// Successful stop command
-		log.info "Successfully called script to stop command $id"
+        err = new StringBuilder()
+        out = new StringBuilder()
+        Process p = Runtime.runtime.exec(cmd)
+        Utils.withStreams(p) {
+            p.waitForProcessOutput(out,err)
+            exitValue = p.waitFor()
+        }
+
+        if( exitValue ) {
+
+            def msg = "SGE failed to stop command $id, returned exit code $exitValue from command line: $cmd"
+            log.severe "Failed stop command produced output: \n$out\n$err"
+            if(!err.toString().trim().isEmpty()) {
+                msg += "\n" + Utils.indent(err.toString())
+            }
+            throw new PipelineError(msg)
+        }
+
+        // Successful stop command
+        log.info "Successfully called script to stop command $id"
     }
 
     @Override
@@ -298,7 +346,12 @@ class SgeCommandExecutor implements CommandExecutor {
 
     @Override
     List<String> getIgnorableOutputs() {
-		//TODO ?? 
-        return null 
+        //TODO ??
+        return null
+    }
+
+    @Override
+    public String statusMessage() {
+        return "SGE Job ID: $commandId command: $cmd"
     }
 }

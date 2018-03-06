@@ -24,6 +24,8 @@
  */
 package bpipe
 
+import java.util.logging.Level;
+
 import groovy.util.logging.Log;
 
 /**
@@ -94,9 +96,15 @@ class PipelineInput {
      */
     List<String> currentFilter = []
     
-    PipelineInput(def input, List<PipelineStage> stages) {
+    /**
+     * Set of aliases to use in mapping file names
+     */
+    Aliases aliases
+    
+    PipelineInput(def input, List<PipelineStage> stages, Aliases aliases) {
         this.stages = stages;
         this.input = input
+        this.aliases = aliases
     }
     
     String toString() {
@@ -109,7 +117,7 @@ class PipelineInput {
         String resolvedValue = boxed[defaultValueIndex]
         if(!this.resolvedInputs.contains(resolvedValue))
             this.resolvedInputs.add(resolvedValue)
-        return String.valueOf(resolvedValue);
+        return this.aliases[String.valueOf(resolvedValue)]
     }
     
     void addResolvedInputs(List<String> objs) {
@@ -147,8 +155,10 @@ class PipelineInput {
      */
     def propertyMissing(String name) {
 		log.info "Searching for missing Property: $name"
-        def resolved
+        List<String> resolved
+        InputMissingError ime
         try {
+            
             if(name =="dir") {
                 log.info "Trying to resolve input as directory ...."
                 resolved = resolveInputAsDirectory()
@@ -162,26 +172,31 @@ class PipelineInput {
                   throw new PipelineError("Insufficient inputs: at least ${defaultValueIndex+1} inputs are expected with extension .${name} but only ${resolved.size()} are available")
             }
             parentError=null
+        		mapToCommandValue(resolved)
         }
         catch(InputMissingError e) {
-            PipelineInput childInp = new PipelineInput(this.resolvedInputs.clone(), stages)
-            childInp.parent = this
-            childInp.resolvedInputs = this.resolvedInputs
-            childInp.currentFilter = this.currentFilter
-            childInp.extensionPrefix = this.extensionPrefix ? this.extensionPrefix+"."+name : name
-            childInp.parentError = e
             log.info("No input resolved for property $name: returning child PipelineInput for possible double extension resolution")
-            return childInp;
+            resolved = this.resolvedInputs
+            ime = e
         }
-		return mapToCommandValue(resolved)
+        
+        PipelineInput childInp = new PipelineInput(resolved.clone(), stages, aliases)
+        childInp.parent = this
+        childInp.resolvedInputs = resolved.clone()
+        childInp.currentFilter = this.currentFilter
+        childInp.extensionPrefix = this.extensionPrefix ? this.extensionPrefix+"."+name : name
+        childInp.defaultValueIndex = defaultValueIndex
+        childInp.parentError = ime
+        return childInp;
+        
      }
     
-    String resolveInputAsDirectory() {
+    List<String> resolveInputAsDirectory() {
         List outputStack = this.computeOutputStack()
         for(List outputs in outputStack) {
             def result = Utils.box(outputs).find { new File(it).isDirectory() }
             if(result)
-                return result
+                return [result]
         }
     }
 	
@@ -193,9 +208,10 @@ class PipelineInput {
 	 * given values.  See also {@link MultiPipelineInput#mapToCommandValue(Object)}
 	 */
 	String mapToCommandValue(def values) {
-        def result = String.valueOf(Utils.box(values)[defaultValueIndex])
-        log.info "Adding resolved input $result"
-        this.addResolvedInputs([result])
+        String rawResolvedInput = String.valueOf(Utils.box(values)[defaultValueIndex])
+        def result = this.aliases[rawResolvedInput]
+        log.info "Adding resolved input $result (raw input = $rawResolvedInput)"
+        this.addResolvedInputs([rawResolvedInput])
         return result
 	}
     
@@ -235,15 +251,30 @@ class PipelineInput {
         resolveInputsEndingWithPatterns(exts.collect { it.replace('.','\\.')+'$' }, exts)
     }
     
+    List<String> probe(def pattern) {
+        if(pattern instanceof String)
+            pattern = pattern.replace('.','\\.')+'$' 
+        
+        // TODO: refactor the resolveInputsEndingWithPatterns method to not return a
+        // list with [null] when there is no result
+        List<String> result = resolveInputsEndingWithPatterns([pattern], [pattern], false)
+        if(result.size()==1 && result[0]  == null)
+            return []
+        return result
+    }
+    
     /**
      * Search the pipeline hierarchy backwards to find inputs matching the patterns specified 
      * in 'exts'.
+     * <p>
+     * Note: exts can be actual java.util.regex.Regex objects. However they are converted to
+     * Strings and parsed and manipulated, so take care in using them this way.
      * 
      * @param exts  pattern (regular expressions) to match
      * @param origs user friendly versions of the above to display in errors
      * @return  list of inputs matching given patterns
      */
-    List<String> resolveInputsEndingWithPatterns(def exts, def origs) {    
+    List<String> resolveInputsEndingWithPatterns(def exts, def origs, failIfNotFound=true) {    
         
         def orig = exts
         synchronized(stages) {
@@ -255,7 +286,7 @@ class PipelineInput {
 	            String pattern = extsAndOrigs[0]
 	            String origName = extsAndOrigs[1]
                 
-                String wholeMatch = '^' + pattern + '$'
+                String wholeMatch = '(^|^.*/)' + pattern + '$'
                 
                 // Special case: treat a leading dot as a literal dot.
                 // ie: if the user specifies ".xml", they probably mean
@@ -269,7 +300,9 @@ class PipelineInput {
                 pattern = '^.*' + pattern
                 log.info "Resolving inputs matching pattern $pattern"
 	            for(s in reverseOutputs) {
-	                log.info("Checking outputs ${s}")
+                    if(log.isLoggable(Level.FINE))
+    	                log.fine("Checking outputs ${s}")
+                        
 	                def o = s.find { it?.matches(wholeMatch) }
                     if(o)
 	                    return s.grep { it?.matches(wholeMatch) }
@@ -282,9 +315,10 @@ class PipelineInput {
 //	                    return o
 	            }
                 missingExts << origName
+                null
 	        }
             
-	        if(missingExts)
+	        if(missingExts && failIfNotFound)
 	            throw new InputMissingError("Unable to locate one or more specified inputs from pipeline with the following extension(s):\n\n" + missingExts*.padLeft(15," ").join("\n"))
 	            
 			log.info "Found files with exts $exts : $filesWithExts"
@@ -307,11 +341,15 @@ class PipelineInput {
             pipeline = pipeline.parent
         }
         
+        PipelineStage currentStage = stages[-1]
         
-        def reverseOutputs = stages.reverse().grep { 
+        def reverseOutputs = stages.reverse().grep {  PipelineStage stage ->
             // Only consider outputs from threads that are related to us but don't consider our own
             // (yet to be created) outputs
-            it.context.threadId in relatedThreads && !this.is(it.context.@inputWrapper)
+            
+            !stage.is(currentStage) && stage.context.threadId in relatedThreads && !inputBelongsToStage(stage)
+            
+            // !this.is(it.context.@inputWrapper) && ( this.parent == null || !this.parent.is(it.context.@inputWrapper)    )
         }.collect { PipelineStage stage ->
             Utils.box(stage.context.@output) 
         }
@@ -331,6 +369,22 @@ class PipelineInput {
         reverseOutputs.add(0,Utils.box(this.@input))        
             
         return reverseOutputs
+    }
+    
+    /**
+     * Return true if this input wrapper or one of its parents is set as
+     * the PipelineInput for the given stage
+     * 
+     * @param stage
+     */
+    boolean inputBelongsToStage(PipelineStage stage) {
+        PipelineInput stageInputWrapper = stage.context.@inputWrapper
+        PipelineInput pinp = this
+        while(pinp != null) {
+            if(pinp.is(stageInputWrapper))
+                return true
+            pinp = pinp.parent
+        }
     }
     
     void addFilterExts(List objs) {

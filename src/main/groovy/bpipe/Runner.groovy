@@ -31,8 +31,12 @@ import java.util.logging.Handler;
 import java.util.logging.Level
 import java.util.logging.Logger;
 
+import org.apache.commons.cli.Option
 import org.codehaus.groovy.runtime.StackTraceUtils;
 
+import bpipe.agent.AgentRunner
+import bpipe.cmd.PreallocateCommand
+import bpipe.cmd.Stop;
 import bpipe.worx.WorxEventListener;
 
 import groovy.transform.CompileStatic;
@@ -55,20 +59,31 @@ class Runner {
     
     final static String builddate = System.getProperty("bpipe.builddate")?:System.currentTimeMillis()
     
+    final static String runDirectory = new File(".").absoluteFile.parentFile.absolutePath
+    
+    final static String canonicalRunDirectory = new File(runDirectory).canonicalPath
+    
     final static ParamsBinding binding = new ParamsBinding()
+    
+    static List<Command> runningCommands = null
 	
     final static String DEFAULT_HELP = """
         bpipe [run|test|debug|execute] [options] <pipeline> <in1> <in2>...
-              retry [test]
-              stop
+              retry [job id] [test]
+              remake <file1> <file2>...
+              resume
+              stop [preallocated]
               history 
               log
               jobs
-              checks
+              checks [options]
+              override 
               status
               cleanup
               query
+              preallocate
               preserve
+              register <pipeline> <in1> <in2>...
               diagram <pipeline> <in1> <in2>...
               diagrameditor <pipeline> <in1> <in2>...
     """.stripIndent().trim()
@@ -80,12 +95,29 @@ class Runner {
     static CliBuilder stopCommandsCli = new CliBuilder(usage: "bpipe stopcommands\n", posix: true)
     
     static CliBuilder diagramCli = new CliBuilder(usage: "bpipe diagram [-e] [-f <format>] <pipeline> <input1> <input2> ...\n", posix: true)
-	
+    
+    static CliBuilder registerCli = new CliBuilder(usage: "bpipe diagram [-e] [-f <format>] <pipeline> <input1> <input2> ...\n", posix: true)
+    
+    /**
+     * Introduced to (attempt to) deal with obscure out-of-memory situations. On rare
+     * occasions Bpipe shuts down with no message in the log files. The best theory that I
+     * have about it is that it's a severe out-of-memory situation and that even the attempts
+     * to write / flush the logs fail. To try and at least trace the problem, we track all
+     * the "normal" exit paths by setting this flag to true, and that way we know the exit
+     * is not "normal" in the shutdown handler and write directly to stderr.
+     */
+    static boolean normalShutdown = true
+    
+    public static final File PAUSE_FLAG_FILE = new File(".bpipe/pause")
+
     public static OptionAccessor opts = runCli.parse([])
     
     public static void main(String [] args) {
         
-//        log.info "Starting in main"
+        if(!BPIPE_HOME || BPIPE_HOME.isEmpty()) {
+            System.err.println "ERROR: The system property bpipe.home was not set. Please check that Bpipe was correctly started from its launch script."
+            System.exit(1)
+        }
         
         def db = new File(".bpipe")
         if(!db.exists())
@@ -95,51 +127,32 @@ class Runner {
         String pid = resolvePID()
         
         Config.config.pid = pid
+        
         Config.config.outputLogPath = ".bpipe/logs/${pid}.log"
         
         // println "Starting Runner at ${new Date()}..."
             
         // PID of shell that launched Bpipe
         String parentPid = System.getProperty("bpipe.pid")
+        Config.config.parentPid = parentPid
         
         // Before we do anything else, add a shutdown hook so that termination of the process causes the job to 
         // to be removed from the user's folder
 //        log.info "Adding shutdown hook"
-        System.addShutdownHook { 
-            
-            def home = System.getProperty("user.home")
-            def jobFile = new File("$home/.bpipedb/jobs/$pid")
-            if(jobFile.exists()) {
-                log.info("Deleting job file $jobFile")
-                if(!jobFile.delete()) {
-                    log.warning("Unable to delete job file for job $pid")
-                    println("WARN: Unable to delete job file for job $pid")
-                }
-            }
-            
-            if(Config.config.eraseLogsOnExit) {
-                new File(".bpipe/logs/${parentPid}.erase.log").text=""
-            }
-            
-            cleanupDirtyFiles()
-            
-            try {
-                // Call events listening for shutdown event
-                EventManager.instance.signal(PipelineEvent.SHUTDOWN, "Shutting down process $pid")
-            }
-            catch(Exception e) {
-                // log.warn "Failure in shutdown events shutdown",e
-            }
+        System.addShutdownHook(Runner.&shutdown)
+        
+        String mode = System.getProperty("bpipe.mode")
+        if(mode == "agent")  {
+           runAgent(args)
+           return 
         }
-                
-//        log.info "Initializing logging ..."
+
         def parentLog = initializeLogging(pid)
         
         log.info "Initializing plugins ..."
         Config.initializePlugins()
         
         def cli 
-        String mode = System.getProperty("bpipe.mode")
         if(mode == "diagram")  {
             log.info("Mode is diagram")
             cli = diagramCli
@@ -147,6 +160,18 @@ class Runner {
                 f "Set output format to 'png' or 'svg'", args:1
             }
             Config.config["mode"] = "diagram"
+        }
+        else
+        if(mode == "preallocate")  {
+            log.info("Mode is preallocate")
+            new PreallocateCommand(args as List).run(System.out)
+            exit(0) 
+        }
+        else
+        if(mode == "register")  {
+            log.info("Mode is register")
+            cli = registerCli
+            Config.config["mode"] = "register"
         }
         else
         if(mode == "documentation")  {
@@ -160,6 +185,12 @@ class Runner {
             cli = diagramCli
             Config.config["mode"] = "diagrameditor"
         }
+        else
+        if(mode == "jobs") {
+            log.info("Mode is jobs")
+            new bpipe.cmd.JobsCommand(args as List).run(System.out)
+            exit(0)
+        } 
         else 
         if(mode == "cleanup") {
             runCleanup(args)
@@ -167,38 +198,63 @@ class Runner {
         else 
         if(mode == "query") {
             log.info("Showing dependency graph for " + args)
-            Dependencies.instance.queryOutputs(args)
-            System.exit(0)
+            new bpipe.cmd.QueryCommand(args as List).run(System.out)
+            exit(0)
         }         
+        else 
+        if(mode == "install") {
+            log.info("Installing tools [args=" + args + "]")
+            new bpipe.cmd.InstallToolsCommand(args as List).run(System.out)
+            exit(0)
+        }        
         else
         if(mode == "preserve") {
             log.info("Preserving " + args)
             this.runPreserve(args)
-            System.exit(0)
+            exit(0)
         } 
         else
         if(mode == "status") {
             log.info("Displaying status")
             this.runStatus(args)
-            System.exit(0)
+            exit(0)
+        } 
+        else
+        if(mode == "stats") {
+            log.info("Displaying stats")
+            new bpipe.cmd.StatsCommand(args as List).run(System.out)
+            exit(0)
         } 
         else
         if(mode == "stopcommands") {
             log.info("Stopping running commands")
             cli = stopCommandsCli
-            Config.config["mode"] = "stopcommands"
-            int count = new CommandManager().stopAll()
-            println "Stopped $count commands"
-            System.exit(0)
+            new Stop(args as List).run(System.out)
+            exit(0)
         } 
         else {
             
-            if(mode == "retry") {
+            if(mode == "retry" || mode == "resume" || mode == "remake") {
+                
+                if(mode == "resume")
+                    runningCommands = CommandManager.getCurrentCommands()
+                
+                // remake is like retry, but we preserve the args to invalidate
+                // their timestamps
+                if(mode == "remake") {
+                    log.info "Remaking $args"
+                    Dependencies.instance.remakeFiles(args as List)
+                    args = [] as String[]
+                    mode = "retry"
+                }
+
                 // Substitute arguments from prior command 
                 // to re-run it
                 def retryInfo = parseRetryArgs(args)
                 args = retryInfo[1]
                 mode = retryInfo[0]
+                
+                Config.config["mode"] = mode
             }
             
             cli = runCli
@@ -210,13 +266,14 @@ class Runner {
                  r longOpt:'report', 'generate an HTML report / documentation for pipeline'
                  'R' longOpt:'report', 'generate report using named template', args: 1
                  n longOpt:'threads', 'maximum threads', args:1
-                 m longOpt:'memory', 'maximum memory', args:1
+                 m longOpt:'memory', 'maximum memory in MB, or specified as <n>GB or <n>MB', args:1
                  l longOpt:'resource', 'place limit on named resource', args:1, argName: 'resource=value'
                  v longOpt:'verbose', 'print internal logging to standard error'
                  y longOpt:'yes', 'answer yes to any prompts or questions'
                  u longOpt:'until', 'run until stage given',args:1
                  p longOpt: 'param', 'defines a pipeline parameter, or file of paramaters via @<file>', args: 1, argName: 'param=value', valueSeparator: ',' as char
                  b longOpt: 'branch', 'Comma separated list of branches to limit execution to', args:1
+                 s longOpt: 'source', 'Load the given pipeline file(s) before running / executing', args: 1
                  'L' longOpt: 'interval', 'the default genomic interval to execute pipeline for (samtools format)',args: 1
             }
             
@@ -227,39 +284,29 @@ class Runner {
         
         def opt = cli.parse(args)
         if(!opt) 
-            System.exit(1)
-            
+            exit(1)
+        
         if(!opt.arguments()) {
             println versionInfo
             cli.usage()
             println "\n"
-            System.exit(1)
+            exit(1)
         }
         
         // Note: configuration reading depends on the script, so this
         // needs to come first
         Config.config.script = opt.arguments()[0]
+        
+        Config.config.pguid = Utils.sha1(canonicalRunDirectory +'$'+Config.config.pid+'$'+Config.config.script) 
 
+        log.info "=================== GUID=${Config.config.pguid} PID=$pid (${Config.config.pid}) =============="
+        
         // read the configuration file, if available
-        log.info "Reading user config ... "
-        Utils.time ("Read user config") {
-            try {
-                Config.readUserConfig()
-            }
-            catch( Exception e ) {
-                def cause = e.getCause() ?: e
-                println("\nError parsing 'bpipe.config' file. Cause: ${cause.getMessage() ?: cause}\n")
-                reportExceptionToUser(e)
-                System.exit(1)
-            }
-        }
-            
+        readUserConfig()
+        
         opts = opt
         if(opts.v) {
-            ConsoleHandler console = new ConsoleHandler()
-            console.setFormatter(new BpipeLogFormatter())
-            console.setLevel(Level.FINE)
-            parentLog.addHandler(console)
+            Utils.configureVerboseLogging()
         }
         
         if(opts.d) {
@@ -271,10 +318,22 @@ class Runner {
             Config.config.maxThreads = Integer.parseInt(opts.n)
             Config.config.customThreads = true
         }
-        
+        else 
+        if(Config.userConfig.containsKey('concurrency')) { // If not specified by command line, look for concurrency in bpipe.config
+            Config.config.maxThreads = Integer.parseInt(String.valueOf(Config.userConfig.concurrency))
+            Config.config.customThreads = true
+        }
+
         if(opts.m) {
-            log.info "Maximum memory specified as $opts.m MB"
-            Config.config.maxMemoryMB = Integer.parseInt(opts.m)
+            log.info "Maximum memory specified as $opts.m"
+            try {
+                Config.config.maxMemoryMB = parseMemoryOption(opts.m)
+            } 
+            catch (Exception e) {
+                System.err.println "\n$e.message\n"
+                cli.usage()
+                exit(1)
+            }
         }
         
         if(opts.l) {
@@ -283,7 +342,7 @@ class Runner {
             if(limit.size()!=2) {
                 System.err.println "\nBad format for limit $opts.l - expect format <name>=<value>\n"
                 cli.usage()
-                System.exit(1)
+                exit(1)
             }
             Concurrency.instance.setLimit(limit[0],limit[1] as Integer)
         }
@@ -306,26 +365,28 @@ class Runner {
         if(Config.userConfig.worx.enable) {
             new WorxEventListener().start()
         }
-
+        
+        String loadArgs = opt.source ? '\n'+opt.source.split(',').collect { "load '$it'\n"}.join("") : ""
+        
         def pipelineArgs = null
         String pipelineSrc
         if(mode == "execute") {
-            pipelineSrc = 'Bpipe.run { ' + opt.arguments()[0] + '}'
+            pipelineSrc = Pipeline.PIPELINE_IMPORTS + loadArgs + ' Bpipe.run { ' + opt.arguments()[0] + '}'
         }
         else {
-            pipelineSrc = loadPipelineSrc(cli, opt.arguments()[0])
+            pipelineSrc = loadPipelineSrc(cli, opt.arguments()[0], loadArgs)
         }
         
         if(opt.arguments().size() > 1)
             pipelineArgs = opt.arguments()[1..-1]
                 
-
         log.info "Loading tool database ... "
         def initThreads = [
                            { ToolDatabase.instance.init(Config.userConfig) },
                            { /* Add event listeners that come directly from configuration */ EventManager.instance.configure(Config.userConfig) },
                            { Concurrency.instance.initFromConfig() },
-                           { if(!opts.t) { NotificationManager.instance.configure(Config.userConfig); configureReportsFromUserConfig() } }
+                           { if(!opts.t) { NotificationManager.instance.configure(Config.userConfig); configureReportsFromUserConfig() } },
+                           { Dependencies.instance.preloadOutputGraph() }
                            ].collect{new Thread(it)}
         initThreads*.start()
 
@@ -334,6 +395,9 @@ class Runner {
         if(!opts.t) {
             Config.config.eraseLogsOnExit = false
             appendCommandToHistoryFile(mode, args, pid)
+            
+            // If we were paused, remove that
+            PAUSE_FLAG_FILE.delete()
         }
         
         if(opts.u) {
@@ -354,7 +418,6 @@ class Runner {
         
         if(opts.L) { 
             Config.userConfig.region = new RegionValue(value: opts.L)
-            binding.setParam("region", Config.userConfig.region)
         }
 
         initThreads*.join(20000)
@@ -372,24 +435,37 @@ class Runner {
         // RUN it
         try {
             log.info "Run ... "
+            normalShutdown = false
             script.run()
+            normalShutdown=true
+            ExecutorPool.shutdownAll()
+            EventManager.instance.signal(PipelineEvent.SHUTDOWN, "Shutting down process $pid")
+            NotificationManager.instance.shutdown()
         }
         catch(MissingPropertyException e)  {
             if(e.type?.name?.startsWith("script")) {
                 // Handle this as a user error in defining their script
                 // print a nicer error message than what comes out of groovy by default
                 handleMissingPropertyFromPipelineScript(e)
-		        System.exit(1)
+                EventManager.instance.signal(PipelineEvent.SHUTDOWN, "Shutting down process $pid")
+		        exit(1)
             }
             else {
                 reportExceptionToUser(e)
-		        System.exit(1)
+                EventManager.instance.signal(PipelineEvent.SHUTDOWN, "Shutting down process $pid")
+		        exit(1)
             }
         }
         catch(Throwable e) {
             reportExceptionToUser(e)
-	        System.exit(1)
+            EventManager.instance.signal(PipelineEvent.SHUTDOWN, "Shutting down process $pid")
+	        exit(1)
         }
+   }
+    
+   static void exit(int code) {
+       normalShutdown = true
+       System.exit(code)
    }
     
    synchronized static reportExceptionToUser(Throwable e) {
@@ -401,17 +477,17 @@ class Runner {
         System.err.println(" Bpipe Error ".center(Config.config.columns,"="))
         
         System.err.println("\nAn error occurred executing your pipeline:\n\n${msg.center(Config.config.columns,' ')}\n")
-		
+        
         if(!(e instanceof ValueMissingError)) {
             System.err.println("\nPlease see the details below for more information.\n")
             System.err.println(" Error Details ".center(Config.config.columns, "="))
             System.err.println()
             Throwable sanitized = StackTraceUtils.deepSanitize(e)
-			StringWriter sw = new StringWriter()
+            StringWriter sw = new StringWriter()
             sanitized.printStackTrace(new PrintWriter(sw))
-			String stackTrace = sw.toString()
-			Pipeline.scriptNames.each { fileName, internalName -> stackTrace = stackTrace.replaceAll(internalName, fileName) }
-			System.err.println(stackTrace)
+            String stackTrace = sw.toString()
+            Pipeline.scriptNames.each { fileName, internalName -> stackTrace = stackTrace.replaceAll(internalName+'(.groovy)?', fileName) }
+            System.err.println(stackTrace)
             System.err.println()
             System.err.println "=" * Config.config.columns
             System.err.println("\nMore details about why this error occurred may be available in the full log file .bpipe/bpipe.log\n")
@@ -428,7 +504,7 @@ class Runner {
         
         // A bit of a hack: the parsed script ends up with a class name like script123243242...
         // so search for that in the stack trace to find the line number
-        int lineNumber = e.stackTrace.find { it.className ==~ /script[0-9]{1,}/ }.lineNumber
+        int lineNumber = e.stackTrace.find { it.className ==~ /script[0-9]{1,}/ }?.lineNumber ?: -1
 
         println """
                     Pipeline Failed!
@@ -442,22 +518,32 @@ class Runner {
     /**
      * Set up logging for the Bpipe diagnostic log
      */
-    public static Logger initializeLogging(String pid) {
+    public static Logger initializeLogging(String pid, String logFileName="bpipe") {
         
         def parentLog = log.getParent()
         parentLog.getHandlers().each { parentLog.removeHandler(it) }
-
+        
+        File logFile = new File(".bpipe/${logFileName}.log")
+        if(logFile.exists()) {
+            logFile.delete()
+        }
+        
         // The current log file
-        FileHandler fh = new FileHandler(".bpipe/bpipe.log")
+        FileHandler fh = new FileHandler(logFile.path)
         fh.setFormatter(new BpipeLogFormatter())
         parentLog.addHandler(fh)
 
-        // Another log file for history
-        new File(".bpipe/logs").mkdirs()
-        Handler pidLog = pid == "tests" ? new ConsoleHandler() : new FileHandler(".bpipe/logs/${pid}.bpipe.log")
-        pidLog.setFormatter(new BpipeLogFormatter())
-        parentLog.addHandler(pidLog)
-
+        try {
+            // Another log file for history
+            new File(".bpipe/logs").mkdirs()
+            Handler pidLog = pid == "tests" ? new ConsoleHandler() : new FileHandler(".bpipe/logs/${pid}.${logFileName}.log")
+            pidLog.setFormatter(new BpipeLogFormatter())
+            parentLog.addHandler(pidLog)
+        }
+        catch(Exception e) {
+            log.info "Error initializing logging: " + e
+        }
+    
 		Properties p = System.properties
         log.info("Starting")
         log.info("OS: " + p['os.name'] + " (" + p['os.version'] + ") Java: " + p['java.version'] + " Vendor: " + p["java.vendor"] )
@@ -465,6 +551,7 @@ class Runner {
         return parentLog
     }
     
+   
     /**
      * Try to determine the process id of this Java process.
      * Because the PID is read from a file that is created after
@@ -496,7 +583,7 @@ class Runner {
                 if(count > 100) {
                     println "ERROR: Bpipe was unable to read its startup PID file from $pidFile.absolutePath"
                     println "ERROR: This may indicate you are in a read-only directory or one to which you do not have full permissions"
-                    System.exit(1)
+                    exit(1)
                 }
 
                 // Spin a short time waiting
@@ -508,26 +595,47 @@ class Runner {
     }
     
     static void loadExternalLibs() {
-       if(Config.userConfig.containsKey("libs")) {
-            if(Config.userConfig.libs instanceof String) {
-                def jars = (Config.userConfig.libs.split(":") as List)
-                for(jar in jars) {
-                    try {
-                        File f = new File(jar)
-                        if(!f.exists()) {
-                            // Attempt to resolve the file relative to the main script location if
-                            // it cannot be resolved directly
-                            f = new File(new File(Config.config.script).canonicalFile.parentFile, jar)
-                        }
-                        Runner.class.classLoader.rootLoader.addURL(f.toURL())
-                    }
-                    catch(Exception e) {
-                        log.severe("Failed to add jar $jar to classpath: " + e)
-                        System.err.println("WARN: Error adding jar $jar to classpath: " + e.getMessage())
-                    }                    
-                }
-            }
+       if(!Config.userConfig.containsKey("libs")) 
+           return
+           
+        def jars = Config.userConfig.libs
+        if(Config.userConfig.libs instanceof String) {
+            jars = jars.tokenize(":") 
         }
+            
+        List resolvedLibs = []
+        for(String jar in jars) {
+            resolvedLibs << loadExternalLib(jar)
+        }
+        Config.userConfig.libs = resolvedLibs
+    }
+    
+    /**
+     * @param libPath   libPath to search for in predefined locations and load
+     * @return          actual resolved library
+     */
+    static String loadExternalLib(String libPath) {
+        try {
+            File f = new File(libPath)
+            if(!f.exists()) {
+                // Attempt to resolve the file relative to the main script location if
+                // it cannot be resolved directly
+                File relativeToScript = new File(new File(Config.config.script).canonicalFile.parentFile, libPath)
+                
+                log.info "Library $f does not exist: checking under path $relativeToScript"
+                if(!relativeToScript.exists()) {
+                    log.info "Path relative to script does not exist: library $libPath may be ignored"
+                }
+                f = relativeToScript
+            }
+            log.info "Attempting to add to classpath: $f.absolutePath"
+            Runner.class.classLoader.rootLoader.addURL(f.toURL())
+            return f.path
+        }
+        catch(Exception e) {
+            log.severe("Failed to add jar $libPath to classpath: " + e)
+            System.err.println("WARN: Error adding jar $libPath to classpath: " + e.getMessage())
+        }                    
     }
                     
     /**
@@ -539,22 +647,23 @@ class Runner {
      * @param srcFilePath
      * @return
      */
-    static String loadPipelineSrc(def cli, def srcFilePath) {
+    static String loadPipelineSrc(def cli, def srcFilePath, String preamble) {
         File pipelineFile = new File(srcFilePath)
         if(!pipelineFile.exists()) {
             println "\nCould not understand command $pipelineFile or find it as a file\n"
             cli.usage()
             println "\n"
-            System.exit(1)
+            exit(1)
         }
         
         // Note that it is important to keep this on a single line because 
         // we want any errors in parsing the script to report the correct line number
         // matching what the user sees in their script
         String pipelineSrc = Pipeline.PIPELINE_IMPORTS + 
-					"bpipe.Pipeline.scriptNames['$pipelineFile.name']=this.class.name;" +
-					 pipelineFile.text
-					 
+                    "bpipe.Pipeline.scriptNames['$pipelineFile.name']=this.class.name;" +
+                    preamble + 
+                    pipelineFile.text
+                     
         if(pipelineFile.text.indexOf("return null") >= 0) {
             println """
                        ================================================================================================================
@@ -563,6 +672,76 @@ class Runner {
             """.stripIndent()
         }
         return pipelineSrc
+    }
+    
+    /**
+     * Centralised directory where in-progress jobs are linked
+     */
+    static final File CENTRAL_JOB_DIR = new File(System.getProperty("user.home") + "/.bpipedb/jobs/")
+    
+    /**
+     * Centralised directory where completed job links are linked
+     */
+    static final File COMPLETED_DIR = new File(System.getProperty("user.home") + "/.bpipedb/completed")
+    
+    /**
+     * The local directory where job information is stored
+     */
+    static final File LOCAL_JOB_DIR = new File(".bpipe/jobs")
+    
+    /**
+     * Bpipe home, set as system property by Bpipe runner script prior to launching
+     */
+    static String BPIPE_HOME = new File(System.getProperty("bpipe.home")).absolutePath
+    
+    /**
+     * Perform essential cleanup when Bpipe process ends.
+     * <p>
+     * Note: This function is added as a shutdown hook. Therefore it executes in the very
+     *       limited context and constraints applied to Java shutdown hooks.
+     */
+    static void shutdown() {
+        
+        String pid = Config.config.pid
+        String parentPid = Config.config.parentPid
+        
+        ExecutorPool.shutdownAll()
+            
+        // The normalShutdown flag is set to false by default, and only set to true
+        // when Bpipe executes through one of the normal / expected paths. In this 
+        // way we have a chance to detect when Bpipe dies through an abnormal 
+        // mechanism.
+        if(!normalShutdown) {
+            if(new File(".bpipe/stopped/$pid").exists())
+                System.err.println "MSG: Bpipe stopped by stop command: " + new Date()
+            else
+                System.err.println "ERROR: Abnormal termination - check bpipe and operating system has enough memory!"
+            System.err.flush()
+        }
+            
+        def home = System.getProperty("user.home")
+        File jobFile = new File(CENTRAL_JOB_DIR, "$pid")
+        if(jobFile.exists()) {
+            
+            if(!COMPLETED_DIR.exists())
+                COMPLETED_DIR.mkdirs()
+                
+            File completedFile = new File(COMPLETED_DIR, pid)
+            if(completedFile.exists())
+                completedFile.delete()
+            
+            log.info("Deleting job file $jobFile")
+            if(!jobFile.renameTo(completedFile)) {
+                log.warning("Unable to move job file for job $pid")
+                println("WARN: Unable to move job file for job $pid")
+            }
+        }
+            
+        if(Config.config.eraseLogsOnExit && parentPid != null) {
+            new File(".bpipe/logs/${parentPid}.erase.log").text=""
+        }
+            
+        cleanupDirtyFiles()
     }
     
     /**
@@ -618,20 +797,14 @@ class Runner {
         }
         def opt = cli.parse(args)
         
-        // Cleanup uses some aspects of user config
-        try {
-            Config.readUserConfig()
-        }
-        catch(Exception e) {
-            println "WARNING: reading config files experienced error: $e"
-        }
-        
+        readUserConfig()
+       
         if(opt.y) {
             Config.userConfig.prompts.handler = { msg -> return "y"}
         }
             
         Dependencies.instance.cleanup(opt.arguments())
-        System.exit(0)
+        exit(0)
     }
     
     /**
@@ -644,14 +817,18 @@ class Runner {
         if(!opt.arguments()) {
             println ""
             cli.usage()
-            System.exit(1)
+            exit(1)
         }
         Dependencies.instance.preserve(opt.arguments())
-        System.exit(0)
+        exit(0)
     }
     
     static void runStatus(def args) {
         new StatusCommand().execute(args)
+    }
+    
+    static void runAgent(def args) {
+        bpipe.agent.AgentRunner.main(args)
     }
     
     /**
@@ -670,7 +847,7 @@ class Runner {
         
         String notFoundMsg = """
             
-            No previous Bpipe command seems to have been run in this directory."
+            No previous Bpipe command seems to have been run in this directory.
 
             """.stripIndent()
             
@@ -682,13 +859,13 @@ class Runner {
         def historyFile = new File(".bpipe/history")
         if(!historyFile.exists()) {
             System.err.println(notFoundMsg);
-            System.exit(1)
+            exit(1)
         }
         
         def historyLines = historyFile.readLines()
         if(!historyLines) {
             System.err.println(notFoundMsg);
-            System.exit(1)
+            exit(1)
         }
         
         String commandLine = null
@@ -708,7 +885,12 @@ class Runner {
                 }
                 else {
                     System.err.println "\nJob ID could not be parsed as integer\n" + usageMsg
-                    System.exit(1)
+                    exit(1)
+                }
+                
+                if(commandLine == null) {
+                    System.err.println "\nCould not find a previous Bpipe run with id ${args[0]}. Please use 'bpipe history' to check for valid run ids.\n" + usageMsg
+                    exit(1)
                 }
             }
             else {
@@ -758,6 +940,56 @@ class Runner {
         }
     }
     
+    /**
+     * Parse the memory option and return the resulting memory amount in MB.
+     * <p>
+     * The value can be specified either as a plain integer (interpreted as MB) or as an integer followed by
+     * either MB or GB. For example:
+     * <li>4GB
+     * <li>4gb
+     * <li>4  (means 4MB)
+     * <li>4MB 
+     */
+    static int parseMemoryOption(String memoryValue) {
+        
+        if(memoryValue.isInteger())
+            return memoryValue.toInteger()
+            
+        // Separate the memory unit from the number
+        def memory = (memoryValue =~ /([0-9]*)([a-zA-Z]{2})/)
+        if(!memory)
+            throw new IllegalArgumentException("Memory value '$memoryValue' couldn't be parsed. Please specify in the form <n>MB or <n>GB")
+        
+        String amount = memory[0][1]
+        String unit = memory[0][2].toUpperCase()
+        
+        if(unit == "MB")
+            return amount.toInteger()
+        
+        if(unit == "GB")
+            return amount.toInteger() * 1000
+    }
+    
+    static void readUserConfig() {
+        log.info "Reading user config ... "
+        Utils.time ("Read user config") {
+            try {
+                Config.readUserConfig()
+            }
+            catch( Exception e ) {
+                def cause = e.getCause() ?: e
+                println("\nError parsing 'bpipe.config' file. Cause: ${cause.getMessage() ?: cause}\n")
+                reportExceptionToUser(e)
+                exit(1)
+            }
+        }
+    }
+
+    static boolean isPaused() {
+        if(PAUSE_FLAG_FILE.exists()) {
+            throw new PipelinePausedException()
+        }
+    }
 }
 
 /**
@@ -778,6 +1010,17 @@ class Runner {
 class ParamsBinding extends Binding {
     
     def parameters = []
+    
+    /**
+     * This global binding takes precendence of the binding assigned to the closures that
+     * represent pipeline stages. This has the unfortunate effect that even if a pipeline stage
+     * has a variable set explicitly with 'using' the global value still takes precedence. This
+     * threadlocal is used to allow such variables to override the global value during execution.
+     * 
+     * @see PipelineStage#runBody
+     * @see #withLocalVariables method
+     */
+    ThreadLocal<Map<String,Object>> stageLocalVariables = new ThreadLocal()
 
     def void setParam( String name, Object value ) {
 
@@ -873,7 +1116,7 @@ class ParamsBinding extends Binding {
             return null
         }
 
-        if( !value ) {
+        if( value == null ) {
             value = true
         }
         else {
@@ -893,4 +1136,25 @@ class ParamsBinding extends Binding {
 
         new MapEntry( key, value )
     }
+    
+    Object withLocalVariables(Map variables, Closure c) {
+        this.stageLocalVariables.set(variables)
+        try {
+          return c()
+        }
+        finally {
+            this.stageLocalVariables.set(null)
+        }
+    }
+    
+    Object getVariable(String name) {
+        if(stageLocalVariables.get()?.containsKey(name)) {
+            return this.stageLocalVariables.get()[name]
+        }
+        else {
+            return super.getVariable(name)
+        }
+    }
 }
+
+

@@ -1,7 +1,9 @@
 package bpipe
 
-import java.util.zip.GZIPInputStream;
+import java.util.regex.Pattern
+import java.util.zip.GZIPInputStream
 
+import groovy.transform.CompileStatic;
 import groovy.util.logging.Log;
 
 @Log
@@ -42,12 +44,17 @@ class RegionSet implements Serializable {
             addSequence(s)
         }
     }
+    
+    private static Pattern LEADING_CHR = ~/^chr/
 
     /**
      * Read a tab separated file in the format provided by UCSC for genes
      * to infer a genome model as a set of regions.
+     * 
+     * @param stream                input stream to read from
+     * @param convertChromosomes    whether to strip 'chr' from chromosome names
      */
-    static RegionSet index(InputStream stream) {
+    static RegionSet index(InputStream stream, boolean convertChromosomes) {
 
         RegionSet g = new RegionSet()
         int count = 0
@@ -57,6 +64,10 @@ class RegionSet implements Serializable {
             List cols = line.split("\t")
             // println  "Gene name = " + cols[12] + " Chr = " + cols[2] + " tx start = " + cols[4] + " tx end = " + cols[5]
             String chr = cols[2]
+            
+            if(convertChromosomes)
+                chr = chr.replaceAll(LEADING_CHR, '')
+            
             Sequence s = g.sequences[chr]
             if(!s) {
                 s = new Sequence(name:chr)
@@ -85,11 +96,49 @@ class RegionSet implements Serializable {
     }
     
     
+    Set<RegionSet> split(List<Object> sequences, int parts) {
+        
+        List<String> sequenceValues = sequences*.toString()
+        
+        new RegionSet(this.sequences.grep { it.key in sequenceValues }*.value).split(parts)
+    }
+    
     /**
      * A synonym for {@link #group(int)}
      */
-    Set<RegionSet> split(int parts) {
-        group(parts)
+    Set<RegionSet> split(Map options=[:], int parts) {
+        group(options, parts)
+    }
+    
+    Set<RegionSet> partition(int sizeBp) {
+        this.sequences.collect { String name, Sequence s ->
+            (s.range.from..s.range.to).step(sizeBp).collect { int startBp ->
+                Sequence seq = new Sequence(s.name)
+                seq.range = new GenomicRange(startBp..Math.min(startBp+sizeBp,s.range.to))
+                new RegionSet(seq)
+            }
+        }.flatten() as Set
+    }
+    
+    static RegionSet bed(Map options=[:], String fileName) {
+        int padding = 0;
+        if(options.padding)
+            padding = options.padding.toInteger()
+
+        RegionSet regionSet = new RegionSet()
+        new File(fileName).eachLine { String line ->
+            List<String> parts = line.tokenize('\t')
+            if(parts.size()<3)
+                throw new PipelineError("BED file should have at least 3 tab separated columns")
+
+
+            int start = Math.max(parts[1].toInteger() - padding, 0)
+            int end = parts[2].toInteger() + padding
+
+            Sequence sequence = new Sequence(name:parts[0], range:(start)..(end))
+            regionSet.addSequence(sequence)
+        }
+        return regionSet
     }
     
     /**
@@ -104,7 +153,9 @@ class RegionSet implements Serializable {
      * @return        A set of RegionSet objects representing the given
      *                genome split into the requested number of parts
      */
-    Set<RegionSet> group(int parts) {
+    Set<RegionSet> group(Map options=[:], int parts) {
+        
+        boolean allowSplitRegions = options.allowBreaks == null ? true : options.allowBreaks
         
         // A sorted set ordered by size and then object to 
         SortedSet<RegionSet> results = new TreeSet({ a,b -> b.size().compareTo(a.size())?:a.hashCode().compareTo(b.hashCode())} as Comparator)
@@ -124,7 +175,7 @@ class RegionSet implements Serializable {
         log.info "*** Splitting regions to increase to $parts parts"
         while(results.size() < parts) {
             // Split the largest region set into two
-            if(!splitLargest(results))
+            if(!splitLargest(results, allowSplitRegions))
                 break
         }
         
@@ -132,7 +183,7 @@ class RegionSet implements Serializable {
         // above loop again to reduce down 
         while(results.first().size() > 2*results.last().size()) {
             log.info "*** Rebalancing regions due to ${results.first().size()} > 2 x ${results.last().size()}"
-            if(!splitLargest(results))
+            if(!splitLargest(results, allowSplitRegions))
                 break
             combineSmallest(results)
         }
@@ -140,14 +191,14 @@ class RegionSet implements Serializable {
         return results
     }
     
-    boolean splitLargest(SortedSet results) {
+    boolean splitLargest(SortedSet results, boolean allowSplitRegions) {
         
         RegionSet largest = results.first()
         
-        def (large,small) = largest.splitInTwo()
+        def (large,small) = largest.splitInTwo(allowSplitRegions)
         float ratio = (float)large.size() / (float)small.size()
         
-        assert ratio > 1.0f
+        assert ratio >= 1.0f : "Ratio of large region to small is > 1 (ratio = $ratio)"
         if(ratio > 0.1 && ratio < 10) {
             results.remove(largest)
             
@@ -179,10 +230,12 @@ class RegionSet implements Serializable {
      * It is possible no split is possible that will return a balanced result 
      * in which case the algorithm gives up and returns the unbalanced split.
      */
-    List splitInTwo() {
+    List splitInTwo(boolean allowSplitSequences) {
         List<Sequence> ordered = ([] + sequences.values()).sort { it.size() }.reverse()
         
-        println "Sequences ordered by size are $ordered"
+        // Start by sorting the regions into two piles by ordering by size
+        // and then putting alternating region sets into each pile
+        // This should give a good start at approximately even sized piles
         
         RegionSet result1 = new RegionSet()
         RegionSet result2 = new RegionSet()
@@ -195,7 +248,15 @@ class RegionSet implements Serializable {
                 result2.addSequence(s)
         }
         
+        // Make a second set of ordered sequences from result1
+        // We expect result1 to be bigger, so we will even up the piles
+        // by splitting regions from result1 and giving them to result2
         List<Sequence> ordered2 = ([] + result1.sequences.values()).sort { it.size() }.reverse()
+        
+        if(!allowSplitSequences)
+            return [result1,result2]
+        
+        log.info("Will check ${ordered2.size()} regions to reassign to other split in case of size bias")
         
         // This loop exits when every sequence from result1 has been tried as a 
         // split candidate OR when the results are sufficiently balanced
@@ -225,6 +286,9 @@ class RegionSet implements Serializable {
                     }
                     else
                         log.info "Ratio $ratio of split ${split[0]} and ${split[1]} to low/high to justify"
+                }
+                else {
+                    log.info("Split of $largest produced zero size second region: ignoring")
                 }
             }
             if(!ordered2)
@@ -259,6 +323,33 @@ class RegionSet implements Serializable {
 		// Combine the two smallest and add them back in as a single RegionSet
 		results.add(new RegionSet(smallest.sequences.values() + secondSmallest.sequences.values()))
 	}
+     
+    private static Pattern ALTERNATE_HAPLOTYPE_PATTERN = ~'.*_hap[0-9]*$'
+     
+    /**
+     * Remove all sequences that do not belong to a major chromosome.
+     * This is interpreted as:
+     * <ul>
+     *  <li>Starts with "Un"
+     *  <li>Ends with "random"
+     *  <li>Ends with "_hap[number]"
+     */
+    // @CompileStatic <= causes strange error at runtime in chr_region test
+    void removeMinorContigs() {
+        
+        Closure notMajorChromosome = { String chr ->
+            chr.startsWith('NC_') ||
+            chr.startsWith('GL') ||
+            chr.startsWith('Un_') ||
+            chr.startsWith('chrUn_') ||
+            chr.startsWith('M') ||
+            chr.startsWith('chrM') ||
+            chr.endsWith('_random') || 
+            chr.matches(ALTERNATE_HAPLOTYPE_PATTERN)
+        }
+        
+        this.sequences = this.sequences.grep { Map.Entry<String,Sequence> e -> !notMajorChromosome(e.key) }.collectEntries()
+    }
     
     long size() {
         // Note: we don't use built in sum() because of worry about int overflow

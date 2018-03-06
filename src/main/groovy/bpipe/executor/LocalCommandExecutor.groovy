@@ -26,10 +26,15 @@
 package bpipe.executor
 
 import groovy.util.logging.Log
+
+import java.beans.PropertyChangeEvent
+import java.lang.ProcessBuilder.Redirect;
+
 import bpipe.Command;
 import bpipe.OutputLog;
 import bpipe.Utils
-import bpipe.CommandStatus;
+import bpipe.CommandStatus
+import bpipe.ForwardHost;
 import bpipe.CommandManager;
 
 /**
@@ -39,21 +44,14 @@ import bpipe.CommandManager;
  * @author simon.sadedin@mcri.edu.au
  */
 @Log
+@Mixin(ForwardHost)
 class LocalCommandExecutor implements CommandExecutor {
     
     public static final long serialVersionUID = 0L
     
     transient Process process
     
-    /**
-     * The output log to which stdout will be written
-     */
-	transient Appendable outputLog = System.out
-    
-    /**
-     * The output log to which stderr will be written
-     */
-	transient Appendable errorLog = System.err
+    transient Command command
     
     /**
      * The exit code returned by the process, only
@@ -75,83 +73,152 @@ class LocalCommandExecutor implements CommandExecutor {
      */
     boolean destroyed = false
     
-    transient Command command
+    String jobDir
     
-	LocalCommandExecutor() {
-	}
+    LocalCommandExecutor() {
+    }
     
-    void start(Map cfg, Command command, File outputDirectory) {
+    /**
+     * Starts a command using a process on the local machine.
+     * <p>
+     * If command.command is null, the command is started in "waiting" mode and
+     * will only run when "activated" by .
+     */
+    void start(Map cfg, Command command, Appendable outputLog, Appendable errorLog) {
         
-      this.command = command
       String cmd = command.command
-      new Thread({
+      
+      
+      Closure executeClosure = {
           
           // Special case for Windows / Cygwin
-		  // On Windows Java detects spaces in arguments and if it finds them
-		  // wraps the whole argument in double quotes.  However it doesn't 
-		  // escape quotes embedded in the argument body, so it actually 
-		  // creates invalid arguments
+          // On Windows Java detects spaces in arguments and if it finds them
+          // wraps the whole argument in double quotes.  However it doesn't 
+          // escape quotes embedded in the argument body, so it actually 
+          // creates invalid arguments
           if(Utils.isWindows()) {
               // See java.lang.ProcessImpl for this test. It is not really correct
-			  // but it is important for it to be the same as what is in the Java src
+              // but it is important for it to be the same as what is in the Java src
               String origCmd = cmd
-			  if(cmd.indexOf(' ') >=0 || cmd.indexOf('\t') >=0) {
+              if(cmd.indexOf(' ') >=0 || cmd.indexOf('\t') >=0) {
                   cmd = cmd.replaceAll(/"/, /\\"/)
-			  }
+              }
               log.info "Converted $origCmd to $cmd to account for broken Java argument escaping"
-		  }
+          }
+          
+          // Create the job directory
+          this.id = command.id.toInteger()
+          this.jobDir = ".bpipe/commandtmp/$id"
+          new File(jobDir).mkdirs()
+          
+          File cmdScript = new File(jobDir, CMD_FILENAME)
+          if(cmd != null) {
+              log.info "No preallocated command executor: running command $id directly"
+              cmdScript.text = cmd
+          }
+          else {
+              log.info "Local command executor is preallocated: will wait for command"
+              command.commandListener =  { Command e ->
+                  log.info "Local pooled command executor now executing: " + e.command
+              }
+          }
+          
+          Map props = cfg + [
+            config : cfg,
+            cmd : cmd,
+            name : command.name,
+            jobDir : jobDir,
+            CMD_FILENAME : cmdScript.path,
+            CMD_PID_FILE : "${CommandManager.DEFAULT_COMMAND_DIR}/${command.id}.pid",
+            CMD_OUT_FILENAME : CMD_OUT_FILENAME,
+            CMD_ERR_FILENAME : CMD_ERR_FILENAME,
+            CMD_EXIT_FILENAME : CMD_EXIT_FILENAME
+          ]
+
+          File wrapperScript = 
+              new CommandTemplate().populateCommandTemplate(new File(jobDir), "executor/local-command.template.sh", props)
           
           this.runningCommand = cmd
           this.startedAt = new Date()
-	      process = Runtime.getRuntime().exec((String[])(['bash','-e','-c',"echo \$\$ > ${CommandManager.DEFAULT_COMMAND_DIR}/${command.id}.pid;\n$cmd"].toArray()))
-          this.command.status = CommandStatus.RUNNING.name()
-          this.command.startTimeMs = System.currentTimeMillis()
-	      process.consumeProcessOutput(outputLog, errorLog)
+          
+          log.info "Launching command wrapper script ${wrapperScript.path}"
+          
+          ProcessBuilder pb = new ProcessBuilder(['nohup','bash','-e',wrapperScript.path])
+          pb.redirectOutput(Redirect.to(new File(jobDir, CMD_OUT_FILENAME)))
+          pb.redirectError(Redirect.to(new File(jobDir, CMD_ERR_FILENAME)))
+          
+          forward("$jobDir/$CMD_OUT_FILENAME", outputLog)
+          forward("$jobDir/$CMD_ERR_FILENAME", errorLog)
+          
+          process = pb.start()
+          
+          command.status = CommandStatus.RUNNING.name()
+          command.startTimeMs = System.currentTimeMillis()
+          command.save()
+          
           exitValue = process.waitFor()
-          this.command.stopTimeMs = System.currentTimeMillis()
-          this.id = command.id.toInteger()
+
+          // Once we know the streams are closed, THEN destroy the process
+          // This guarantees that file handles are cleaned up, even if
+          // other things above went horribly wrong
+          try { this.process.destroy() } catch(Throwable t) {}
+
+          command.stopTimeMs = System.currentTimeMillis()
+          
           synchronized(this) {
-	          this.notifyAll()
+              this.notifyAll()
           }
-      }).start()
+      }
+      
+      Thread runnerThread = new Thread(executeClosure)
+      runnerThread.daemon = true
+      runnerThread.start()
+      
       while(!process) 
-	    Thread.sleep(100)
+        Thread.sleep(100)
     }
     
+    transient String lastStatus = CommandStatus.UNKNOWN.name()
+   
     String status() {
         String result = statusImpl()
-        this.command.status = result
+        if(command && (result != lastStatus)) {
+            if(result == CommandStatus.RUNNING.name()) {
+                this.command.startTimeMs = System.currentTimeMillis()
+                this.command.save()
+            }
+            lastStatus = result
+        }
         return result  
     }
     
     String statusImpl() {
         
         // Try to read PID
-        if(pid == -1L && id != null) {
-            File pidFile = new File("${CommandManager.DEFAULT_COMMAND_DIR}/${id}.pid")
-            if(pidFile.exists()) {
-                pid = pidFile.text.trim().toInteger()
-                
-                // Update the serialized file object so that it contains the PID
-                File pidCommandFile = new File(CommandManager.DEFAULT_COMMAND_DIR, String.valueOf(id)) 
-                pidCommandFile.withObjectOutputStream { it << this }
-            }
-        }
-        
+        readPID()
+       
         if(!this.process && this.pid != -1L) {
             try {
-                String info = "ps -o ppid,ruser --pid ${this.pid}".execute().text
+                String info = "ps -o ppid,ruser -p ${this.pid}".execute().text
                 def lines = info.split("\n")*.trim()
                 if(lines.size()>1)  {
-                    processInfo = lines[1].split(" ")[1]; 
-                    if(processInfo[1] == System.properties["user.name"]) {
-                        return CommandStatus.RUNNING
+                    info = lines[1].split(" ")[1]; 
+                    if(info == System.properties["user.name"]) {
+                        return CommandStatus.RUNNING.name()
                     }
+                }
+                
+                // Not found? look at exit code if we can
+                Integer storedExitCode = readStoredExitCode()
+                if(storedExitCode != null) {
+                    exitValue = storedExitCode
+                    return CommandStatus.COMPLETE
                 }
             }
             catch(Exception e) {
-                
+                log.info "Exception occurred while probing status of command $id: $e"
             }
+            
             return CommandStatus.UNKNOWN
         }
         else
@@ -167,12 +234,45 @@ class LocalCommandExecutor implements CommandExecutor {
      * @return
      */
     int waitFor() {
-        while(true) {
-            if(status() == CommandStatus.COMPLETE.name())
+        
+        if(!this.process && this.pid != -1L) {
+            Integer exitCode =  readStoredExitCode()
+            if(exitCode != null) {
+                this.exitValue = exitCode
                 return exitValue
+            }
+        }
+        
+        while(true) {
+            if(status() == CommandStatus.COMPLETE.name()) {
+                return exitValue
+            }
              synchronized(this) {
                  this.wait(500)
              }
+        }
+    }
+    
+    void readPID() {
+        if(pid == -1L && id != null) {
+            File pidFile = new File("${CommandManager.DEFAULT_COMMAND_DIR}/${id}.pid")
+            log.info "Checking for pid file $pidFile for local command $id"
+            if(pidFile.exists()) {
+                pid = pidFile.text.trim().toInteger()
+                log.info "Read pid=$pid for local command $id"
+            }
+        }
+    }
+    
+    Integer readStoredExitCode() {
+        File exitFile = new File(".bpipe/commandtmp/$id/$CMD_EXIT_FILENAME")
+        if(exitFile.exists()) {
+            log.info "Exit file $exitFile exists: reading exit code"
+            return exitFile.text.trim().toInteger()
+        }
+        else {
+            log.info "Exit file $exitFile does not exist yet"
+            return null
         }
     }
     
@@ -181,18 +281,36 @@ class LocalCommandExecutor implements CommandExecutor {
     }
     
     void stop() {
-        // Not implemented.  Java is too stupid to stop a process it previously started.
-        // So how do commands get stopped then? Well, the 'bpipe stop' first calls the 
-        // Java way (necessary for other executors), then it scans the processes
-        // that are a child of the Bpipe process and kills them too. This means
-        // if the Bpipe process dies another way, it's possible that we can't stop
-        // the children any more (a bug)
+        
+        // There are scenarios where we could try to stop a command before it got to read
+        // its own PID (note PID is only read lazily above as part of status call)
+        readPID()
+        
+        log.info "Shutting down local job $id with pid $pid"
+        
+        List killCmd = ["bash","-c","source ${bpipe.Runner.BPIPE_HOME}/bin/bpipe-utils.sh; killtree $pid"]
+        Map killResult = Utils.executeCommand(killCmd)
+        if(killResult.exitValue != 0) {
+            throw new RuntimeException("Attempt to kill process returned exit code " + 
+                "$killResult.exitValue using command:\n\n$killCmd\n\nOutput:\n\n$killResult.out\n\n$killResult.err")
+        }
+        
+        // Store an exit code so that future status calls will know that the command 
+        // exited via a normal process and not abruptly killed
+        File exitFile = new File(".bpipe/commandtmp/$id/$CMD_EXIT_FILENAME")
+        exitFile.text = "-1"
     }
     
+    @Override
     void cleanup() {
+        
+        log.info "Cleanup command $id"
+        
+        this.stopForwarding()
     }
     
     String statusMessage() {
         "$runningCommand, running since $startedAt (local command, pid=$pid)"
     }
+    
 }

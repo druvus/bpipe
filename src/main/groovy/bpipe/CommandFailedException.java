@@ -33,16 +33,8 @@ package bpipe;
  */
 class CommandFailedException extends PipelineError {
 
-    public CommandFailedException() {
-        super();
-    }
-
-    public CommandFailedException(String arg0, Throwable arg1) {
-        super(arg0, arg1);
-    }
-
-    public CommandFailedException(String arg0) {
-        super(arg0);
+    public CommandFailedException(String arg0, PipelineContext ctx) {
+        super(arg0, ctx);
     }
 
     public CommandFailedException(Throwable arg0) {

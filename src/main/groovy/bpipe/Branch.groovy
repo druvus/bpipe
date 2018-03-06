@@ -25,6 +25,7 @@
 package bpipe
 
 import groovy.transform.CompileStatic;
+import java.util.regex.Pattern
 
 /**
  * Metadata about a branch within a pipeline
@@ -35,7 +36,11 @@ import groovy.transform.CompileStatic;
  * 
  * @author simon.sadedin@mcri.edu.au
  */
-class Branch extends Expando {
+class Branch extends Expando implements Serializable {
+    
+    private static Pattern REMOVE_TRAILING_DOT_SECTIONS_PATTERN = ~'\\.[^.]*$'
+    
+    public static final long serialVersionUID = 0L
     
     @Delegate
     String name = ""
@@ -43,6 +48,8 @@ class Branch extends Expando {
     String dir = "."
     
     Branch parent = null
+    
+    transient Closure dirChangeListener = null
     
     Branch getTop() { // Causes compile to fail :-(
         if(parent == null) {
@@ -56,12 +63,65 @@ class Branch extends Expando {
     public void setParent(Branch parent) {
         // Copy values of properties 
         parent.properties.each { entry ->
-            this.setProperty(entry.key, entry.value)
+            if(entry.key != 'name')
+                this.setProperty(entry.key, entry.value)
         }
+        this.parent = parent
     }
     
     @Override
     String toString() {
         name
+    }
+    
+    /**
+     * Search upwards until we find a name that can be used to identify the branch
+     * that isn't blank and isn't numeric. This is designed for generating a user 
+     * recognisable identifier that can trace the origin of this branch.
+     * 
+     * @return identifier for the ancestry of this branch
+     */
+    @CompileStatic
+    String getFirstNonTrivialName() {
+        Branch parent = null;
+        
+        String sanitisedPipelineName = name?.replaceAll(REMOVE_TRAILING_DOT_SECTIONS_PATTERN,'');
+       
+        if(sanitisedPipelineName && !sanitisedPipelineName.isNumber())
+            return sanitisedPipelineName
+            
+        if(parent == null)
+            return sanitisedPipelineName // if no parent then we're stuck with whatever we have
+            
+        return parent.getFirstNonTrivialName()
+    }
+    
+    void setDir(String dir) {
+        this.dir = dir;
+        if(this.dirChangeListener != null)
+            this.dirChangeListener(dir)
+    }
+    
+    void setProperty(String name, Object value) {
+        
+        if((name in PipelineCategory.closureNames.values()) && !(value instanceof Closure)) {
+            throw new PipelineError("""
+                Attempt to define a branch variable $name with same name as a pipeline stage. 
+            
+                Please ensure that pipeline stages have different names to branch variables.
+            """.stripIndent())
+        }
+        else {
+            if(name == 'dirChangeListener') {
+                this.dirChangeListener = value
+            }            
+            else
+            if(name == 'dir') {
+                this.dir = value
+                if(this.dirChangeListener != null)
+                    this.dirChangeListener(value)
+            }
+            super.setProperty(name,value)
+        }
     }
 }

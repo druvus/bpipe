@@ -24,57 +24,53 @@
  */
 package bpipe
 
+import groovy.json.JsonOutput;
 import groovy.text.GStringTemplateEngine;
 import groovy.text.GStringTemplateEngine.GStringTemplate;
-import groovy.time.TimeCategory;
+import groovy.time.TimeCategory
+import groovy.transform.CompileStatic
 
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
-import java.lang.reflect.Method;
+import java.lang.reflect.Method
+import java.nio.file.Files;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import groovy.util.logging.Log;
+import groovy.xml.MarkupBuilder;
+import groovy.transform.CompileStatic;
 
 import java.util.logging.Level;
 import java.util.regex.Pattern;
+import java.util.zip.GZIPInputStream
 
 import org.codehaus.groovy.reflection.CachedMethod;
+import org.codehaus.groovy.runtime.ReverseListIterator
 
 import bpipe.graph.Graph;
 import static Utils.isContainer 
 import static Utils.unbox 
 
-
-/**
- * This class is a hack / workaround to enable a specific syntax quirk
- * to work in an intuitive way. Normally groovy evaluates expressions left
- * to right, so closure + list invokes Closure.plus(List ...). However if the
- * List is the first item in the expression: list + closure then Groovy tries to invoke
- * List.plus() which places the closure into the list instead of implementing Bpipe's
- * pipeline logic. This class is part of how we hack groovy to make the syntax work
- * how we want (see below for where it is used).
- */
-class ListBouncer {
-    List elements = []
-    
-    // Note: invoked when diagram is created
-    void call() {
-    }
-    
-    String toString() {
-        "LB:[" + elements.collect {PipelineCategory.closureNames[it]?:String.valueOf(it)}.join(",")+"]"
-    }
-}
+import static Edge.*
 
 /**
  * Utility to convert a Node structure to a Map structure (primarily, for export as Json)
  */
 class NodeListCategory {
     static Map toMap(Node n) {
-        return  n.children()?[name: n.name(), children: n.children()*.toMap()]:[name:n.name()]
+        return  n.children()?[name: n.name(), type: n.attributes().type, children: n.children()*.toMap()]:[name:n.name(), type: n.attributes().type]
     }
     static String toJson(Node n) {
         groovy.json.JsonOutput.toJson(n.toMap())
+    }
+}
+
+class ClosureScript extends Script {
+    Closure closure
+    def run() {
+        closure.resolveStrategy = Closure.DELEGATE_FIRST
+        closure.delegate = this
+        closure.call()
     }
 }
 
@@ -84,18 +80,23 @@ class NodeListCategory {
  * surrounding category to enable implicit pipeline stage functions.
  */
 @Log
-public class Pipeline {
+public class Pipeline implements ResourceRequestor {
     
     /**
      * Default imports added to the top of all files executed by Bpipe
      */
-    static final String PIPELINE_IMPORTS = "import static Bpipe.*; import Preserve as preserve; import Intermediate as intermediate; import Accompanies as accompanies; import Produce as produce; import Transform as transform; import Filter as filter;"
+    static final String PIPELINE_IMPORTS = "import static Bpipe.*; import static bpipe.RegionSet.bed; import Preserve as preserve; import Intermediate as intermediate; import Accompanies as accompanies; import Produce as produce; import Transform as transform; import Filter as filter;"
     
     /**
      * The thread id of the master thread that is running the baseline root
      * pipeline
      */
     static Long rootThreadId
+    
+    /**
+     * The top level pipeline at the root of the pipeline hierarchy
+     */
+    static Pipeline rootPipeline
     
     /**
      * A map of script file names to internal Groovy class names. This is needed
@@ -107,6 +108,11 @@ public class Pipeline {
      * by Bpipe on the first line.
      */
     static Map<String,String> scriptNames = Collections.synchronizedMap([:])
+    
+    /**
+     * Index of pipeline stage nodes, keyed of the closure that implements the stage
+     */
+    static Map<Closure, Node>   stageNodeIndex = Collections.synchronizedMap([:])
     
     /**
      * Global binding - variables and functions (including pipeline stages)
@@ -125,6 +131,11 @@ public class Pipeline {
     Map<String,String> variables = [:]
     
     /**
+     * File name mappings belonging to this pipeline instance
+     */
+    Aliases aliases = new Aliases()
+    
+    /**
      * Id of thread that is running this pipeline
      */
     Long threadId
@@ -133,7 +144,12 @@ public class Pipeline {
      * List of past stages that have already produced outputs.  This 
      * list is built up progressively as pipeline stages execute.
      */
-    def stages = []
+    List<PipelineStage> stages = []
+    
+    /**
+     * List of pipeline stages executed by *this* pipeline
+     */
+    List<PipelineStage> myStages = []
     
     /**
      * A list of "dummy" stages that are actually used to link other stages together
@@ -158,12 +174,37 @@ public class Pipeline {
     int childCount = 0
     
     /**
+     * The index of this child in the children of its parent
+     */
+    int childIndex = -1
+    
+    String id = "0"
+    
+    /**
      * Metadata about the branch within which this pipeline is running. 
      * The primary meta data is a name for the pipeline that is added to 
      * output file names when the pipeline is run as a child pipeline.
      * This is null and not used in the default, root pipeline
      */
     Branch branch = new Branch(name:"")
+    
+    /**
+     * Date / time when this pipeline started running
+     * Only populated for main / root level pipeline instance
+     */
+    Date startDate 
+    
+    /**
+     * Date / time when this pipeline finished running
+     * Only populated for main / root level pipeline instance
+     */
+    Date finishDate 
+    
+    boolean isIdle = false
+    
+    boolean isBidding() {
+        return !isIdle;
+    }
     
     void setBranch(Branch value) {
         this.branch = value
@@ -258,6 +299,10 @@ public class Pipeline {
     
     static title(String theTitle) {
         about(title:theTitle)
+    }
+    
+    static name(String theName) {
+        about(name:theName)
     }
     
     static version(Object version) {
@@ -384,12 +429,12 @@ public class Pipeline {
             
             if(o instanceof Range) {
                 for(r in o) {
-                    result << new Chr('chr'+r, cfg)
+                    result << new Chr(defaultGenomeChrPrefix+r, cfg)
                 }
             }
             else 
             if(o instanceof String || o instanceof Integer) {
-                result << new Chr('chr'+o, cfg)
+                result << new Chr(defaultGenomeChrPrefix+o, cfg)
             }
         }
         
@@ -397,8 +442,9 @@ public class Pipeline {
         // check for overlap
         if(Config.userConfig.region) {
             if(result.any { it.name == Config.userConfig.region.value }) {
-              result.clear()
-              result.add(new Chr(Config.userConfig.region.value, cfg))
+                log.info "Overriding pipeline regions with region specified on command line: ${Config.userConfig.region}"
+                result.clear()
+                result.add(new Chr(Config.userConfig.region.value, cfg))
             }
             else {
                 println "WARNING: region specified on command line or configuration (${Config.userConfig.region})  does not overlap regions specified in pipeline: $objs"
@@ -417,13 +463,32 @@ public class Pipeline {
         
         Pipeline pipeline = new Pipeline()
         PipelineCategory.addStages(pipelineBuilder.binding)
+        
+        log.info "Segment is loading external stages"
         if(!pipelineBuilder.binding.variables.containsKey("BPIPE_NO_EXTERNAL_STAGES"))
             pipeline.loadExternalStages()
 
+        log.info "Segment finished loading external stages"
+        
         Object result = pipeline.execute([], pipelineBuilder.binding, pipelineBuilder, false)
+        
         segmentJoiners.addAll(pipeline.joiners)
+        
+        if(!(result in segmentBuilders))
+            segmentBuilders[result] = pipelineBuilder
+        
         return result
     }
+    
+    /**
+     * A map from the generated closure for a segment to the closure that
+     * built it. This allows us to know which builder was used for a closure when
+     * it is encountered. It is used in the constructing the graph structure of the
+     * pipeline which needs to understand which closures are segments and 
+     * to invoke the builder to recreate the segment in graph form (see
+     *  DefinePipelineCategory).
+     */
+    static Map<Closure,Closure> segmentBuilders = [:]
     
     static List<Closure> segmentJoiners = []
     
@@ -436,10 +501,19 @@ public class Pipeline {
     }
     
     static def run(Object host, Closure pipeline) {
-       run(pipeline.binding.variables.args, host, pipeline) 
+        if((host instanceof String) || (host instanceof List)) {
+            // When it is a string, interpret it as an input file
+            run(host, pipeline.binding, pipeline) 
+        }
+        else
+            run(pipeline.binding.variables.args, host, pipeline) 
     }
     
     static def run(def inputFile, Object host, Closure pipelineBuilder) {
+        
+        if(Config.config.mode in ["run","retry","resume","remake"]) { 
+            ExecutorPool.startPools(ExecutorFactory.instance, Config.userConfig) 
+        }  
         
         log.info("Running with input " + inputFile)
         
@@ -458,20 +532,27 @@ public class Pipeline {
         
         Pipeline pipeline = new Pipeline()
         
+        if(Config.userConfig.region != null) {
+            pipeline.branch.region = Config.userConfig.region
+        }
+        
         // To make life easier when a single argument is passed in,
         // debox it from the array so that pipeline stages that 
         // expect a single input do not unexpectedly get an array    
         inputFile = Utils.unbox(inputFile)
         
-        PipelineCategory.addStages(host)
+        if(host)
+            PipelineCategory.addStages(host)
+            
         if(!(host instanceof Binding))
             PipelineCategory.addStages(pipelineBuilder.binding)
             
+        pipeline.loadToolVariables()
         pipeline.loadExternalStages()
         pipeline.joiners += segmentJoiners
 
         def mode = Config.config.mode 
-        if(mode == "run" || mode == "documentation") // todo: documentation should be its own mode! but can't support that right now
+        if(mode in ["run","documentation","register","resume"]) // todo: documentation should be its own mode! but can't support that right now
             pipeline.execute(inputFile, host, pipelineBuilder)
         else
         if(mode in ["diagram","diagrameditor"])
@@ -489,7 +570,8 @@ public class Pipeline {
      */
     void runSegment(def inputs, Closure s) {
         try {
-            currentRuntimePipeline.set(this)
+            
+            currentRuntimePipeline.set(this) 
         
             this.rootContext = createContext()
             
@@ -519,9 +601,23 @@ public class Pipeline {
                 println "${new Date()} MSG: Branch ${branch=='all'?'':branch} completed: $e.message"
                 aborted = true
             }
+            catch(PipelinePausedException e) {
+                log.info "Pipeline segment ${this.branch} has terminated by user initiated pause"
+                
+                println "${new Date()} MSG: Branch ${branch=='all'?'':branch} aborted due to user initiated pause"
+                aborted = true
+            }
             catch(PipelineError e) {
-                log.info "Pipeline segment failed (2): " + e.message
-                System.err << "Pipeline failed! (2) \n\n"+e.message << "\n\n"
+                log.info "Pipeline segment in thread ${Thread.currentThread().id} failed (2): " + e.message
+//                System.err << "Pipeline failed! (2) \n\n"+e.message << "\n\n"
+                
+                if(!e.summary) {
+                    if(e.ctx && e.ctx.stageName != "Unknown")
+                        System.println "ERROR: stage $e.ctx.stageName failed: $e.message \n"
+                    else
+                        System.println "ERROR: $e.message \n" 
+                }
+                        
                 failed = true
                 if(e instanceof PatternInputMissingError)
                     throw e
@@ -529,7 +625,8 @@ public class Pipeline {
             }
             catch(PipelineTestAbort e) {
                 log.info "Pipeline segment aborted due to test mode"
-                println "\n\nAbort due to Test Mode!\n\n" + Utils.indent(e.message) + "\n"
+                if(!e.summary)
+                    println "\n\nAbort due to Test Mode!\n\n" + Utils.indent(e.message) 
                 failReason = "Pipeline was run in test mode and was stopped before performing an action. See earlier messages for details."
                 failed = true
             }
@@ -537,29 +634,37 @@ public class Pipeline {
                 // This is important to prevent the parent from allowing the pipeline to continue
                 // in the face of things like OutOfMemoryError etc.
                 failed = true 
-                log.severe "Internal error: " + e.toString()
+                log.severe "Internal error in thread ${Thread.currentThread().id}: " + e.toString()
                 System.err.println "Internal error: " + e.toString()
                 throw e
             }
         }
         finally {
-            log.info "Finished running segment for inputs $inputs"
+            log.info "Finished running segment in thread ${Thread.currentThread().id} for inputs $inputs"
+            Concurrency.instance.unregisterResourceRequestor(this)
         }
     }
+    
+    /**
+     * The current pipeline build operation - if building the real pipeline,
+     * it's PipelineCategory, but when the pipeline structure graph is being 
+     * created, it's DefinePipelineCategory
+     */
+    static Class builderCategory = PipelineCategory
     
 
     private Closure execute(def inputFile, Object host, Closure pipeline, boolean launch=true) {
         
         Pipeline.rootThreadId = Thread.currentThread().id
         this.threadId = Pipeline.rootThreadId
+        Pipeline.rootPipeline = this
         
         // We have to manually add all the external variables to the outer pipeline stage
         this.externalBinding.variables.each { 
             log.info "Loaded external reference: $it.key"
-            if(!pipeline.binding.variables.containsKey(it.key))
-                pipeline.binding.variables.put(it.key,it.value) 
-            else
+            if(pipeline.binding.variables.containsKey(it.key))
                 log.info "External reference $it.key is overridden by local reference"    
+            pipeline.binding.variables.put(it.key,it.value) 
         }
         
         // We have to manually add all the external variables to the outer pipeline stage
@@ -575,151 +680,192 @@ public class Pipeline {
         this.externalBinding.variables += pipeline.binding.variables
         
         def cmdlog = CommandLog.cmdLog
-        def startDate = new Date()
+        startDate = new Date()
         if(launch) {
-            cmdlog.write("")
-            String startDateTime = startDate.format("yyyy-MM-dd HH:mm") + " "
-            cmdlog << "#"*Config.config.columns 
-            cmdlog << "# Starting pipeline at " + (new Date())
-            cmdlog << "# Input files:  $inputFile"
-            cmdlog << "# Output Log:  " + Config.config.outputLogPath 
-            
-            OutputLog startLog = new OutputLog("----")
-            startLog.bufferLine("="*Config.config.columns)
-            startLog.bufferLine("|" + " Starting Pipeline at $startDateTime".center(Config.config.columns-2) + "|")
-            startLog.bufferLine("="*Config.config.columns)
-            startLog.flush()
-            
-            about(startedAt: startDate)
+            initializeRunLogs(inputFile)
         }
         
-        ArrayList.metaClass.plus = { x ->
-//            log.info "Interception list plus(" + delegate?.class?.name + "," + x?.class?.name + ")"
-            if(x instanceof Closure) {
-                if(delegate && (delegate[-1] instanceof ListBouncer)) {
-                    delegate[-1].elements.add(x)
-                    return delegate
-                }
-                else {
-                    ListBouncer b = new ListBouncer()
-                    b.elements.add(x)
-                    delegate.add(b)
-                    return delegate
-                }
-            }
-            else {
-                ArrayList result = new ArrayList()
-                result.addAll(delegate)
-                result.add(x)
-                return result
-            }
-        }
-
-        Node pipelineStructure = launch ? diagram(host, pipeline) : null
+        Map pipelineStructure = launch ? diagram(host, pipeline) : null
         
-//        println "Executing pipeline: "
-//        use(NodeListCategory) {
-//            println groovy.json.JsonOutput.prettyPrint(pipelineStructure.toJson())
-//            EventManager.instance.signal(PipelineEvent.STARTED, "Pipeline started", [pipeline:pipelineStructure.toMap()])
-//        }
-//    
         def constructedPipeline
-        use(PipelineCategory) {
+        use(builderCategory) {
             
-           
             // Build the actual pipeline
             Pipeline.withCurrentUnderConstructionPipeline(this) {
-                
                 constructedPipeline = pipeline()
-                
                 // See bug #60
                 if(constructedPipeline instanceof List) {
-                    
-                    // If ListBouncer at the end ...
-                    ListBouncer bouncer = null
-                    log.info("Constructed pipeline is list: " + constructedPipeline)
-                    
-                    int bouncerIndex = constructedPipeline.findIndexOf { it instanceof ListBouncer }
-                    if(bouncerIndex>=0) {
-                        log.info "Found list bouncer at $bouncerIndex: bouncing it out ...."
-                        bouncer = constructedPipeline[bouncerIndex]
-                        for(int i=bouncerIndex+1;i<constructedPipeline.size();++i) {
-                            bouncer.elements.add(constructedPipeline[i])
-                        }
-                        constructedPipeline = constructedPipeline[0..(bouncerIndex-1)]
-                        log.info("Constructed pipeline after bouncing is : " + constructedPipeline)
-                    }
-                    
                     currentRuntimePipeline.set(this)
                     constructedPipeline = PipelineCategory.splitOnFiles("*", constructedPipeline, false)
-                    if(bouncer != null) {
-                        constructedPipeline = constructedPipeline + bouncer.elements.sum()
-                    }
                 }
-            }
+            }   
             
             if(launch) {
-                try {
-                    this.checkRequiredInputs(Utils.box(inputFile))
-                    runSegment(inputFile, constructedPipeline)
-                }
-                catch(PatternInputMissingError e) {
-                    new File(".bpipe/prompt_input_files." + Config.config.pid).text = ''
-                }
-                catch(InputMissingError e) {
-                    println """
-                        A required input was missing from the files given as input.
-                        
-                                 Input Type:  $e.inputType
-                                Description:  $e.description""".stripIndent()
-                    failed = true
-                }
+                EventManager.instance.signal(PipelineEvent.STARTED, "Pipeline started", [pipeline:pipelineStructure])
                 
-                Date finishDate = new Date()
-                
-                println("\n"+" Pipeline Finished ".center(Config.config.columns,"="))
-                if(rootContext)
-                  rootContext.msg "Finished at " + finishDate
-                  
-                about(finishedAt: finishDate)
-                cmdlog << "# " + (" Finished at " + finishDate + " Duration = " + TimeCategory.minus(finishDate,startDate) +" ").center(Config.config.columns,"#")
-               
-                /*
-                def w =new StringWriter()
-                this.dump(w)
-                w.flush()
-                println w
-                */
-                
-                // See if any checks failed
-                List<Check> allChecks = Check.loadAll()
-                List<Check> failedChecks = allChecks.grep { !it.passed && !it.override }
-                if(failedChecks) {
-                    println "\nWARNING: ${failedChecks.size()} check(s) failed. Use 'bpipe checks' to see details.\n"
-                }
-                
-                EventManager.instance.signal(PipelineEvent.FINISHED, "Pipeline " + (failed?"Failed":"Succeeded"), [pipeline:this, checks:allChecks])
-                if(!failed) {
-                    summarizeOutputs(stages)
-                }
+                launchPipeline(constructedPipeline, inputFile, startDate) 
             }
         }
 
         // Make sure the command log ends with newline
         // as output is not terminated with one by default
         cmdlog << ""
+       
+        return constructedPipeline
+    }
+    
+    /**
+     * Run the pipeline, handling any errors and printing out results to the
+     * console.
+     * 
+     * @param constructedPipeline
+     * @param inputFile
+     */
+    void launchPipeline(def constructedPipeline, def inputFile, Date startDate) {
         
-        if(launch) {
-            /*
-            if(Config.config.mode == "documentation" || Config.config.report) 
-                documentation()
-            else
-            if(Config.config.customReport)
-                generateCustomReport(Config.config.customReport)
-              */
+        def cmdlog = CommandLog.cmdLog
+        
+        String failureMessage = null
+        try {
+            this.checkRequiredInputs(Utils.box(inputFile))
+            
+            if(!Runner.opts.t) {
+                new File(".bpipe/run.pid").text = Config.config.pid
+                File jobFile = new File(Runner.LOCAL_JOB_DIR, Config.config.pid)
+                jobFile.append("-----------------------\npguid: " + Config.config.pguid+"\n")
+            }
+            runSegment(inputFile, constructedPipeline)
+                    
+            if(failed) {
+                failureMessage = ("\n" + failExceptions*.message.join("\n"))
+            }
+        }
+        catch(PatternInputMissingError e) {
+            new File(".bpipe/prompt_input_files." + Config.config.pid).text = ''
+        }
+        catch(InputMissingError e) {
+            failureMessage = """
+                A required input was missing from the files given as input.
+                        
+                         Input Type:  $e.inputType
+                        Description:  $e.description""".stripIndent()
+            failed = true
+        }
+        catch(PipelineError e) {
+            failed = true
+        }
+        catch(Exception e) {
+            log.throwing "Pipeline", "Unexpected failure", e
+            failed = true
+            throw e
+        }
+                
+        finishDate = new Date()
+        if(Runner.opts.t && failed && failExceptions.empty) { 
+            println("\n"+" Pipeline Test Succeeded ".center(Config.config.columns,"="))
+        }
+        else {
+            println("\n"+" Pipeline ${failed?'Failed':'Succeeded'} ".center(Config.config.columns,"="))
+        }
+        if(failed) {
+            println failureMessage
+            println()
+            println "Use 'bpipe errors' to see output from failed commands."
+            println()
+        }
+                
+        if(rootContext)
+          rootContext.msg "Finished at " + finishDate
+          
+        about(finishedAt: finishDate)
+        cmdlog << "# " + (" Finished at " + finishDate + " Duration = " + TimeCategory.minus(finishDate,startDate) +" ").center(Config.config.columns,"#")
+               
+        /*
+        def w =new StringWriter()
+        this.dump(w)
+        w.flush()
+        println w
+        */
+                
+        // See if any checks failed
+        List<Check> allChecks = Check.loadAll()
+        List<Check> failedChecks = allChecks.grep { !it.passed && !it.override }
+        if(failedChecks) {
+            println "\nWARNING: ${failedChecks.size()} check(s) failed. Use 'bpipe checks' to see details.\n"
         }
         
-        return constructedPipeline
+        log.info "Sending FINISHED event"
+                
+        EventManager.instance.signal(PipelineEvent.FINISHED, "Pipeline " + (failed?"Failed":"Succeeded"), 
+            [ 
+                pipeline:this, 
+                checks:allChecks, 
+                result:!failed, 
+                startDate:startDate,
+                finishDate:finishDate,
+                commands: CommandManager.executedCommands
+            ])
+        
+        if(!Runner.opts.t)
+            saveResultState(failed, allChecks, failedChecks) 
+        
+        if(!failed) {
+            summarizeOutputs(stages)
+        }
+    }
+    
+    static String DATE_FORMAT="yyyy-MM-dd HH:mm:ss"
+    
+    void saveResultState(boolean failed, List<Check> allChecks, List<Check> failedChecks) {
+       
+        new File(".bpipe/results").mkdirs()
+        
+        // Compute the total runtime of all tools
+        long commandTimeMs = CommandManager.executedCommands.sum {  Command cmd -> (cmd.stopTimeMs - cmd.startTimeMs) }
+        if(commandTimeMs == null)
+            commandTimeMs = 0
+                  
+        new File(".bpipe/results/${Config.config.pid}.xml").withWriter { w ->
+            MarkupBuilder xml = new MarkupBuilder(w)
+            xml.job(id:Config.config.pid) {
+                succeeded(String.valueOf(!failed))
+                startDateTime(startDate.format(DATE_FORMAT))
+                endDateTime(finishDate.format(DATE_FORMAT))
+                totalCommandTimeSeconds(commandTimeMs/1000)
+                
+                commands {
+                   CommandManager.executedCommands.each {  Command cmd ->
+                        command {
+                            id(cmd.id)
+                            stage(cmd.name)
+                            branch(cmd.branch?.name?:"")
+                            content(cmd.command)
+                            start(new Date(cmd.startTimeMs).format(DATE_FORMAT))
+                            end(new Date(cmd.stopTimeMs).format(DATE_FORMAT))
+                            exitCode(cmd.exitCode)
+                        }
+                   }
+                }
+            }
+        }
+    }
+    
+    void initializeRunLogs(def inputFile) {
+        def cmdlog = CommandLog.cmdLog
+        cmdlog.write("")
+        String startDateTime = startDate.format("yyyy-MM-dd HH:mm") + " "
+        cmdlog << "#"*Config.config.columns 
+        cmdlog << "# Starting pipeline at " + (new Date())
+        cmdlog << "# Input files:  $inputFile"
+        cmdlog << "# Output Log:  " + Config.config.outputLogPath 
+            
+        OutputLog startLog = new OutputLog("----")
+        startLog.bufferLine("="*Config.config.columns)
+        startLog.bufferLine("|" + " Starting Pipeline at $startDateTime".center(Config.config.columns-2) + "|")
+        startLog.bufferLine("="*Config.config.columns)
+        startLog.flush()
+            
+        about(startedAt: startDate)
     }
     
     PipelineContext createContext() {
@@ -740,7 +886,7 @@ public class Pipeline {
      * Note:  the new pipeline is not run by this method; instead you have to
      *        call one of the {@link #run(Closure)} methods on the returned pipeline
      */
-    Pipeline fork(Node branchPoint, String childName) {
+    Pipeline fork(Node branchPoint, String childName, String id = null) {
         
         assert branchPoint in this.node.children()
         
@@ -748,10 +894,44 @@ public class Pipeline {
         p.node = new Node(branchPoint, childName, [type:'pipeline',pipeline:p])
         p.stages = [] + this.stages
         p.joiners = [] + this.joiners
+        p.aliases = this.aliases
         p.parent = this
+        p.childIndex = this.childCount
+        
+        if(id == null) 
+            p.id = this.stages[-1].id + "_" + this.childCount
+        else
+            p.id = id
+        
 //        branchPoint.appendNode(p.node)
         ++this.childCount
+            
         return p
+    }
+    
+    private void loadToolVariables() {
+        if('install' in Config.userConfig) {
+            ConfigObject toolsCfg = Config.userConfig.install.tools
+            for(String toolName in toolsCfg.keySet()) {
+                String toolVariable = toolName.toUpperCase()
+                if(externalBinding.variables.containsKey(toolVariable)) {
+                    log.info "Skip setting tool variable $toolVariable because already defined"
+                    continue
+                }
+                    
+                Tool tool = ToolDatabase.instance.tools[toolName]
+                if(!tool) {
+                    throw new PipelineError("A tool $toolName was referenced in the install section but is not a known tool in the tool database. Please define this tool in your 'tools' section.")
+                }
+                
+                if(tool.config.containsKey("installExe") && tool.config.containsKey("installPath")) {
+                    File scriptParentDir = new File(Config.config.script).absoluteFile.parentFile
+                    File exeFile = new File(scriptParentDir, tool.config.installPath + "/" + tool.config.installExe)
+                    log.info "Setting tool variable $toolVariable automatically to $exeFile.absolutePath based on install section of config"
+                    externalBinding.variables.put(toolVariable,exeFile.absolutePath)
+                }
+            }
+        }
     }
     
     private void loadExternalStages() {
@@ -764,7 +944,7 @@ public class Pipeline {
         while(true) {
           pipeFolders.addAll(loadedPaths)
           loadedPaths = []
-          loadExternalStagesFromPaths(shell, pipeFolders)
+          loadExternalStagesFromPaths(shell, pipeFolders, true, true)
           pipeFolders.clear() 
           
           if(loadedPaths.isEmpty())
@@ -774,7 +954,9 @@ public class Pipeline {
     
     static Set allLoadedPaths = new HashSet()
     
-    private static void loadExternalStagesFromPaths(GroovyShell shell, List<File> paths) {
+    static List<File> currentLoadingPaths = Collections.synchronizedList([])
+    
+    private static void loadExternalStagesFromPaths(GroovyShell shell, List<File> paths, cache=true, includesLibs=false) {
         
         for(File pipeFolder in paths) {
             
@@ -795,38 +977,63 @@ public class Pipeline {
                 System.err.println("Pipeline folder $pipeFolder was not a normal directory or file")
             }
             
+            // Avoid recursive loading; caused by segments defined inside loaded files,
+            // which attempt to reload everything inside the loadedPaths list
+            libPaths = libPaths.grep { f -> !currentLoadingPaths.any { it.absolutePath == f.absolutePath } }
+            
             libPaths.sort()
+            
+            currentLoadingPaths.add(pipeFolder)
+            
+            try {
+                loadExternalStagesFromPathList(shell, libPaths, cache, includesLibs)
+            }
+            finally {
+                currentLoadingPaths.remove(pipeFolder)
+            }
+            
+            log.info "Adding stages from evaluation of $paths"
+            PipelineCategory.addStages(shell.context)
+            log.info "Added stages from evaluation of $paths"
+
+        }
+    }
+    
+    private static void loadExternalStagesFromPathList(GroovyShell shell, List<File> libPaths, boolean cache, boolean includesLibs) {
+        
+            log.info "Evaluating paths: $libPaths"
                 
             // Load all the scripts from this path / folder
             libPaths.each { File scriptFile ->
-                if(allLoadedPaths.contains(scriptFile.canonicalPath)) {
+                if(cache && allLoadedPaths.contains(scriptFile.canonicalPath)) {
                     log.info "Skip loading $scriptFile.canonicalPath (already loaded)"
                     return
                 }
                 
                 log.info("Evaluating library file $scriptFile")
                 try {
-                    
+                    String scriptClassName = scriptFile.name.replaceAll('.groovy$','_bpipe.groovy')
                     Script script = shell.evaluate(PIPELINE_IMPORTS+
-                        " binding.variables['BPIPE_NO_EXTERNAL_STAGES']=true;" +
+                        (includesLibs?" binding.variables['BPIPE_NO_EXTERNAL_STAGES']=true;":"") +
                         "bpipe.Pipeline.scriptNames['$scriptFile']=this.class.name;" +
-                         scriptFile.text + "\nthis", scriptFile.name.replaceAll('.groovy$','_bpipe.groovy'))
+                         scriptFile.text + "\nthis", scriptClassName)
                     
-                    script.getMetaClass().getMethods().each { CachedMethod m ->
-                        if(m.declaringClass.name.matches("Script[0-9]*") && !["__\$swapInit","run","main"].contains(m.name)) {
-                          shell.context.variables[m.name] = { Object[] args -> script.getMetaClass().invokeMethod(script,m.name,args) }
-                        }
+                    log.info "Successfully evaluated " + scriptFile
+                    script.getMetaClass().getMethods().grep { CachedMethod m ->
+                        (m.declaringClass.name.endsWith("_bpipe") && !["__\$swapInit","run","main"].contains(m.name)) 
+                    }.each { CachedMethod m ->
+                        shell.context.variables[m.name] = { Object[] args -> script.getMetaClass().invokeMethod(script,m.name,args) }
                     }
                     log.fine "Binding now has variables: " + shell.context.variables
-                    allLoadedPaths.add(scriptFile.canonicalPath)
+                    
+                    if(cache)
+                        allLoadedPaths.add(scriptFile.canonicalPath)
                 }
                 catch(Exception ex) {
                     log.log(Level.SEVERE,"Failed to evaluate script $scriptFile: "+ ex, ex)
-                    System.err.println("WARN: Error evaluating script $scriptFile: " + ex.getMessage())
+                    throw new PipelineError("Error evaluating script '$scriptFile': " + ex.getMessage())
                 }
             }
-          }
-          PipelineCategory.addStages(shell.context)
     }
     
     /**
@@ -864,13 +1071,15 @@ public class Pipeline {
      */
     static Map<String,RegionSet> genomes = [:]
     
+    static Map<String, Map<String,Integer>> genomeChromosomeSizes = [:]
+    
     /**
      * Include pipeline stages from the specified path into the pipeline
      * @param path
      */
     static synchronized void load(String path) {
         File f = new File(path)
-        if(!f.exists()) {
+        if(!Utils.fileExists(f)) {
             // Attempt to resolve the file relative to the main script location if
             // it cannot be resolved directly
             f = new File(new File(Config.config.script).canonicalFile.parentFile, path)
@@ -886,47 +1095,130 @@ public class Pipeline {
         if(!f.exists()) 
             throw new PipelineError("A script, requested to be loaded from file '$path', could not be accessed.")
             
-        def shell = new GroovyShell(Runner.binding)
-        loadExternalStagesFromPaths(shell, [f])
-         
+        if(currentRuntimePipeline.get()) {
+            Pipeline pipeline = currentRuntimePipeline.get()
+            Binding binding = new Binding()
+            binding.variables = Runner.binding.variables.clone()
+            def shell = new GroovyShell(binding)
+            
+            // Note: do not cache - different branches may need to load the same file
+            // which caching would prevent
+            loadExternalStagesFromPaths(shell, [f], false) 
+            shell.context.variables.each { name, value ->
+                log.info "Loaded variable $name into branch $pipeline.branch.name"
+                pipeline.branch[name] = value
+            }
+        }
+        else  {
+            def shell = new GroovyShell(Runner.binding)
+            loadExternalStagesFromPaths(shell, [f])
+        }
+            
         loadedPaths << f
+    }
+    
+    static synchronized void config(Closure cfgClosure) {
+        ConfigObject newConfig = new ConfigSlurper().parse(new ClosureScript(closure:cfgClosure))
+        Config.userConfig.merge(newConfig)
+    }
+    
+    /**
+     * These genomes are automatically converted from UCSC format if specified.
+     * That is, we still download gene / genome definitions from UCSC in UCSC format,
+     * but strip off the 'chr' from sequence names. No liftover is performed.
+     */
+    static Map CONVERTED_GENOMES = [
+                                    'GRCh37' : 'hg19',
+                                    'GRCh38': 'hg38'
+                                   ] 
+    
+    static String defaultGenome = null
+    
+    static String defaultGenomeChrPrefix = 'chr'
+    
+    static synchronized void genome(String name) {
+        genome(contigs:false, name)
     }
     
     /**
      * Load the specified genome model into memory, possibly downloading it from UCSC
      * if necessary
      */
-    static synchronized void genome(String name) {
+    static synchronized void genome(Map options, String name) {
         File genomesDir = new File(System.getProperty("user.home"), ".bpipedb/genomes")
         if(!genomesDir.exists())
             if(!genomesDir.mkdirs())
                 throw new IOException("Unable to create directory to store genomes. Please check permissions for $genomesDir")
                 
-        
         // Construct a UCSC URL based on the given name and then download the genes from there
         File cachedGenome = new File(genomesDir, "${name}.ser.gz")
-        RegionSet genome
-        if(cachedGenome.exists()) {
-            log.info "Loading cached genome : $cachedGenome"
-            long startTimeMs = System.currentTimeMillis()
-            genome = RegionSet.load(cachedGenome) 
-            println "Finished loading genome $cachedGenome in ${System.currentTimeMillis() - startTimeMs} ms"
-            
-        } 
+        File chromFile = new File(genomesDir,"chromInfo.${name}.txt")
+        
+        // Since we use UCSC as a data source we need to intelligently convert to a
+        // corresponding UCSC genome identifier as well as record wither 'chr' is
+        // prepended to chromosome symbols
+        String ucscName = name
+        boolean convertChromosomes = false
+        if(name in CONVERTED_GENOMES) {
+            ucscName = CONVERTED_GENOMES[name]
+            convertChromosomes = true
+            Pipeline.defaultGenomeChrPrefix = ''
+        }
         else {
-            String url = "http://hgdownload.soe.ucsc.edu/goldenPath/$name/database/ensGene.txt.gz"
-            log.info "Downloading genome from $url"
+            Pipeline.defaultGenomeChrPrefix = 'chr'
+        }
+        
+        if(!cachedGenome.exists()) {
+            String url = "http://hgdownload.soe.ucsc.edu/goldenPath/$ucscName/database/ensGene.txt.gz"
+            log.info "Downloading ensembl gene database from $url"
+            println "MSG: Downloading genome from $url"
             new URL(url).openStream().withStream { stream ->
-                genome = RegionSet.index(stream) 
+                RegionSet genome = RegionSet.index(stream, convertChromosomes) 
                 genome.name = name
                 new FileOutputStream(cachedGenome).withStream { outStream ->
                     new ObjectOutputStream(outStream) << genome
                 }
             }
+            
+            // Download chromosome sizes for specified genome
+            url = "http://hgdownload.soe.ucsc.edu/goldenPath/$ucscName/database/chromInfo.txt.gz"
+            log.info "Downloading chromosome sizes from $url"
+            println "MSG: Downloading chromosome sizes from $url"
+            new GZIPInputStream(new URL(url).openStream()).withStream { stream ->
+                chromFile.withOutputStream { outStream ->
+                    Files.copy(stream,outStream)
+                }
+            }
         }
-                
-        Pipeline.genomes[name] = genome
+        
+        Pipeline.genomes[name] = loadCachedGenome(cachedGenome, options.contig?true:false)
+        
+        Pipeline.genomeChromosomeSizes[name] = 
+            chromFile.readLines()*.tokenize('\t').collectEntries { [ convertChromosomes ? it[0].replaceAll('^chr','') :  it[0], it[1].toInteger() ]}
+        
+        Pipeline.defaultGenome = name
     }
+    
+    /**
+     * Load a genome from the given file, which should be a serialized RegionSet object.
+     * 
+     * @param cachedGenome  The file to load from
+     * @param loadContigs   If true, unassembled contigs will be included, otherwise only
+     *                      major chromosomes will be loaded.
+     * @return  A regionset containing the entire genome which can be referenced in the 
+     *          pipeline
+     */
+    static RegionSet loadCachedGenome(File cachedGenome, boolean loadContigs) {
+        log.info "Loading cached genome : $cachedGenome"
+        long startTimeMs = System.currentTimeMillis()
+        RegionSet genome = RegionSet.load(cachedGenome) 
+        if(!loadContigs) {
+            genome.removeMinorContigs()
+        }
+        println "Finished loading genome $cachedGenome in ${System.currentTimeMillis() - startTimeMs} ms"
+        return genome
+    }
+    
     
     /**
      * This method creates documentation for a pipeline based on the 
@@ -1009,33 +1301,52 @@ public class Pipeline {
      * @param pipeline  Closure that is to execute the pipeline
      * @return  A tree of Nodes reflecting the pipeline structure
      */
-    Node diagram(Object host, Closure pipeline) {
+    Map diagram(Object host, Closure pipeline) {
         
-        // We have to manually add all the external variables to the outer pipeline stage
-        this.externalBinding.variables.each {
-            log.info "Loaded external reference: $it.key"
-            if(!pipeline.binding.variables.containsKey(it.key))
-                pipeline.binding.variables.put(it.key,it.value)
-            else
-                log.info "External reference $it.key is overridden by local reference"
-        }
-        
-        // Figures out what the pipeline stages are 
-        if(host)
-            pipeline.setDelegate(host)
+        try {
+            Pipeline.builderCategory = DefinePipelineCategory
             
-        DefinePipelineCategory.reset()
-        use(DefinePipelineCategory) {
-            def realizedPipeline = pipeline()
-            Utils.box(realizedPipeline).each { realizedBranch ->
-                if(!(realizedBranch in PipelineCategory.closureNames)) {
-                    realizedBranch()
-                }
+            // We have to manually add all the external variables to the outer pipeline stage
+            this.externalBinding.variables.each {
+                log.info "Loaded external reference: $it.key"
+                if(!pipeline.binding.variables.containsKey(it.key))
+                    pipeline.binding.variables.put(it.key,it.value)
                 else
-                    DefinePipelineCategory.inputStage.appendNode(PipelineCategory.closureNames[realizedBranch])
+                    log.info "External reference $it.key is overridden by local reference"
             }
+            
+            // Figures out what the pipeline stages are 
+            if(host)
+                pipeline.setDelegate(host)
+                
+            DefinePipelineCategory.reset()
+            use(DefinePipelineCategory) {
+                def realizedPipeline = pipeline()
+                Utils.box(realizedPipeline).each { realizedBranch ->
+                    if(!(realizedBranch in PipelineCategory.closureNames) && (realizedBranch !=null)) {
+                        if(realizedBranch instanceof Closure) {
+                            realizedBranch()
+                        }
+                    }
+                    else {
+                        DefinePipelineCategory.inputStage.appendNode(
+                            PipelineCategory.closureNames[realizedBranch])
+                        
+                        Node rootNode = DefinePipelineCategory.createNode(realizedBranch)
+                        DefinePipelineCategory.edges.add(
+                            new Edge(DefinePipelineCategory.inputStage, rootNode, RESOURCE))
+                    }
+                }
+            }
+            return [
+                root : DefinePipelineCategory.inputStage, 
+                nodes: DefinePipelineCategory.nodes, 
+                edges: DefinePipelineCategory.edges*.toMap()
+            ]
         }
-        return DefinePipelineCategory.inputStage
+        finally {
+            Pipeline.builderCategory = PipelineCategory
+        }
     }
     
     final int dumpTabWidth = 8
@@ -1070,11 +1381,11 @@ public class Pipeline {
     /**
      * This method creates a diagram of the pipeline instead of running it
      */
-    void renderMxGraph(Node root, String fileName, boolean editor) {
+    void renderMxGraph(Map structure, String fileName, boolean editor) {
                
         // Now make a graph
         // println "Found stages " + DefinePipelineCategory.stages
-        Graph g = new Graph(root)
+        Graph g = new Graph(structure.root)
         if(editor) {
             g.display()
         }
@@ -1085,6 +1396,17 @@ public class Pipeline {
             String outputExtension = opts.f ? "."+opts.f : ".png"
             String outputFileName = fileName+outputExtension
             println "Creating diagram $outputFileName"
+            if(opts.f == "json")  {
+//                use(NodeListCategory) {
+//                    new File(outputFileName).text = root.toJson()
+//                }
+                
+                use(NodeListCategory) {
+                    new File(outputFileName).text =    
+                        JsonOutput.toJson(getNodeGraph(structure))
+                }
+            }
+            else
             if(opts.f == "svg") 
                 g.renderSVG(outputFileName)
             else
@@ -1096,11 +1418,37 @@ public class Pipeline {
     }
     
     /**
+     * Convert information from the Node representation of the pipeline into
+     * a list of nodes and edges suitable for export as a graph structure.
+     * 
+     * @param Map   map containing a list of nodes under key 'nodes' and a list 
+     *              of edges under entry 'edges'
+     * @return
+     */
+    static Map getNodeGraph(Map structure) {
+       [
+            nodes: structure.nodes.collect { 
+              [ 
+                  name: it.value.name(),
+                  id: it.value.attributes().id,
+                  type: it.value.attributes().type
+              ]
+           },
+           edges: structure.edges
+      ] 
+    }
+    
+    /**
      * Stores the given stage as part of the execution of this pipeline
      */
     void addStage(PipelineStage stage) {
         synchronized(this.stages) {
+           
+            stage.id = Pipeline.stageNodeIndex[stage.body]?.attribute('id')
+            
             this.stages << stage
+            this.myStages << stage
+            
             node.appendNode(stage.stageName, [type:'stage','stage' : stage])
         }
     }
@@ -1116,14 +1464,19 @@ public class Pipeline {
     void summarizeOutputs(List stages) {
         
         Dependencies.instance.reset()
-        List all = Dependencies.instance.findLeaves(Dependencies.instance.outputGraph)*.values.flatten()*.outputPath
+        def graph = Dependencies.instance.outputGraph
+        List all = Dependencies.instance.findLeaves(graph)*.values.flatten()*.outputPath
+        
+        Utils.time("Save output graph") {
+            Dependencies.instance.saveOutputGraphCache()
+        }
         
         def runFiles = Dependencies.instance.outputFilesGenerated
         
         // Sort to put files generated by this run first
         all = all.sort {runFiles.contains(it) ? 0 : 1 }
                  // Remove files that don't exist any more
-                 .grep { new File(it).exists() }.
+                 .grep { it && new File(it).exists() }.
                  // Add 'pre-existing' for files that were not generated by this Bpipe run
                  collect { runFiles.contains(it) ? it : it + ' (pre-existing)' }
         
@@ -1165,15 +1518,47 @@ public class Pipeline {
         return f
     }
     
+    List<String> cachedBranchPath = null
+    
+    @CompileStatic 
     List<String> getBranchPath() {
+        
+        if(cachedBranchPath != null)
+            return cachedBranchPath
+        
         Pipeline current = this
-        List branches = this.name ? [this.name] : []
+        List<String> branches = this.name ? (List<String>)[this.name] : (List<String>)[]
         while(current.parent != null && current.parent != current) {
             if(current.parent.name)
                 branches.add(current.parent.name)
             current = current.parent
         }
+        cachedBranchPath = branches
         return branches
+    }
+    
+    /**
+     * Compute a unique id for the current stage of this pipeline.
+     * <p>
+     * The id identifies the stage uniquely within the pipeline graph. Two separate
+     * instances of the same stage within a pipeline will receive separate ids, while
+     * two references at the same position in the graph (for example, executed in
+     * parallel) will receive the same id.
+     */
+    String getStageId() {
+        def result = stages.reverse().grep { PipelineStage stage ->
+            stage instanceof FlattenedPipelineStage ||
+                (!stage.synthetic && PipelineCategory.closureNames[stage.body])
+        }.collect { PipelineStage stage ->
+            if(stage instanceof FlattenedPipelineStage)
+                stage.merged*.stageName.join(DefinePipelineCategory.stageSeparator)
+            else
+                stage.stageName 
+        }.join(DefinePipelineCategory.stageSeparator)         
+        
+        println "Computed stage id: " + result
+        
+        return result
     }
     
     List<String> getUnappliedBranchNames() {
@@ -1188,4 +1573,5 @@ public class Pipeline {
         }
         return branches
     }
+    
 }

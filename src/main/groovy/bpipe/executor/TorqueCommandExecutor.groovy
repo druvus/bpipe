@@ -27,6 +27,7 @@ package bpipe.executor
 import groovy.util.logging.Log
 import bpipe.Command;
 import bpipe.ForwardHost;
+import bpipe.Utils
 
 /**
  * Implementation of support for TORQUE resource manager.
@@ -61,15 +62,15 @@ class TorqueCommandExecutor extends CustomCommandExecutor implements CommandExec
      * These appear as files in the local directory.
      */
     @Override
-    public void start(Map cfg, Command command, File outputDirectory) {
+    void start(Map cfg, Command command, Appendable outputLog, Appendable errorLog) {
         
-        super.start(cfg, command, outputDirectory);
+        super.start(cfg, command, outputLog, errorLog);
         
         // After starting the process, we launch a background thread that waits for the error
         // and output files to appear and then forward those inputs
         log.info "Forwarding file " + this.jobDir+"/${command.id}.out"
-        forward(this.jobDir+"/${command.id}.out", System.out)
-        forward(this.jobDir+"/${command.id}.err", System.err)
+        forward(this.jobDir+"/${command.id}.out", outputLog)
+        forward(this.jobDir+"/${command.id}.err", errorLog)
     }
 
     /**
@@ -103,6 +104,14 @@ class TorqueCommandExecutor extends CustomCommandExecutor implements CommandExec
      */
     List<String> getIgnorableOutputs() {
         return [ this.name + '.o.*$', this.name + '.e.*$' ]
+    }
+    
+    void setJobName(String jobName) {
+        log.info("Setting job name for $commandId to $jobName")
+        Map result = Utils.executeCommand(["qalter","-N",jobName, this.commandId])
+        if(result.exitValue != 0) {
+            log.warning("Unable to set job name to $jobName for $commandId. Command output: " + result.out)
+        }
     }
 
     String toString() {
